@@ -36,6 +36,7 @@ from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
 
+from day_utils import ScoreDayResolver
 from slack_sdk.errors import SlackApiError
 
 
@@ -183,6 +184,8 @@ def _extract_candidates(
     channel: str,
     msgs: Iterable[Dict[str, Any]],
     day_key: str,
+    *,
+    day_resolver: Optional[ScoreDayResolver] = None,
 ) -> List[CandidateMsg]:
     """
     Keep only unique user messages in this channel that:
@@ -193,6 +196,7 @@ def _extract_candidates(
     """
     out: List[CandidateMsg] = []
     seen_ts: Set[str] = set()
+    day_resolver = day_resolver or ScoreDayResolver(getattr(bot, "store", None))
 
     for m in msgs:
         if not isinstance(m, dict):
@@ -215,11 +219,16 @@ def _extract_candidates(
 
         try:
             message_day = bot.day_key_from_ts(slack_ts)
-            parse_for_day = getattr(bot, "parse_score_for_day", None)
-            parsed = parse_for_day(text, message_day) if callable(parse_for_day) else None
-            if (getattr(parsed, "score_day", None) or message_day) != day_key:
-                continue
+        except (TypeError, ValueError, OverflowError):
+            continue
+
+        parse_for_day = getattr(bot, "parse_score_for_day", None)
+        try:
+            parsed = parse_for_day(text, message_day) if callable(parse_for_day) else bot.parse_score(text)
         except Exception:
+            continue
+
+        if day_resolver.resolve(message_day, parsed) != day_key:
             continue
 
         out.append(CandidateMsg(channel=channel, user_id=user_id, slack_ts=slack_ts, text=text))
@@ -242,6 +251,7 @@ def sync_slack_history_for_day(
     *,
     reparse_all: bool = True,
     log_events: bool = True,
+    day_resolver: Optional[ScoreDayResolver] = None,
 ) -> int:
     """Fetch Slack's current message text for a day and upsert parseable scores.
 
@@ -250,6 +260,7 @@ def sync_slack_history_for_day(
     the bot never received the corresponding ``message_changed`` event.
     """
     store = bot.store
+    day_resolver = day_resolver or ScoreDayResolver(store)
     oldest_utc, latest_utc = _day_window_utc(bot, day)
     thread_lookback_secs = 2 * 86400
     top_msgs = _fetch_channel_messages(
@@ -274,7 +285,7 @@ def sync_slack_history_for_day(
         seen_threads.add(thread_ts)
         all_msgs.extend(_fetch_thread_replies(bot, channel, thread_ts))
 
-    candidates = _extract_candidates(bot, channel, all_msgs, day)
+    candidates = _extract_candidates(bot, channel, all_msgs, day, day_resolver=day_resolver)
 
     def _candidate_ts(candidate: CandidateMsg) -> float:
         try:
@@ -306,11 +317,14 @@ def sync_slack_history_for_day(
         message_day = bot.day_key_from_ts(candidate.slack_ts)
         parsed = parse_for_day(candidate.text, message_day) if callable(parse_for_day) else bot.parse_score(candidate.text)
         if not parsed:
-            parsed = bot.resolve_pinpoint_fail_score(candidate.text, day, store_obj=store)
+            parsed = bot.resolve_pinpoint_fail_score(candidate.text, message_day, store_obj=store)
         if not parsed:
             continue
 
-        upserts.append((day, candidate.user_id, parsed, candidate.slack_ts, candidate.text))
+        effective_day = day_resolver.resolve(message_day, parsed)
+        if effective_day != day:
+            continue
+        upserts.append((effective_day, candidate.user_id, parsed, candidate.slack_ts, candidate.text))
 
         if log_events:
             event_id = _history_event_id(candidate)
@@ -336,9 +350,6 @@ def sync_slack_history_for_day(
 
 
 def main():
-    bot = _load_bot_module()
-    store = bot.store
-
     ap = argparse.ArgumentParser()
     ap.add_argument("day", help="YYYY-MM-DD (bucketed using SCORE_DAY_TZ, default America/Vancouver)")
     ap.add_argument("--channel", default="", help="Channel ID to scan (defaults to SCORE_CHANNEL_ID env var)")
@@ -351,6 +362,10 @@ def main():
     ap.add_argument("--no-post", dest="post", action="store_false", help="When used with --finalize, do not post to Slack")
     ap.set_defaults(post=True)
     args = ap.parse_args()
+
+    bot = _load_bot_module()
+    store = bot.store
+    day_resolver = ScoreDayResolver(store)
 
     day = args.day.strip()
     channel = args.channel.strip() or getattr(bot, "SCORE_CHANNEL_ID", "").strip()
@@ -389,7 +404,7 @@ def main():
             all_msgs.extend(replies)
 
     # Extract candidate messages that belong to this day bucket
-    candidates = _extract_candidates(bot, channel, all_msgs, day)
+    candidates = _extract_candidates(bot, channel, all_msgs, day, day_resolver=day_resolver)
 
     # Sort oldest->newest so later scores overwrite earlier ones naturally
     def _tsf(ts: str) -> float:
@@ -444,8 +459,13 @@ def main():
         message_day = bot.day_key_from_ts(c.slack_ts)
         parsed = parse_for_day(c.text, message_day) if callable(parse_for_day) else bot.parse_score(c.text)
         if not parsed:
-            parsed = bot.resolve_pinpoint_fail_score(c.text, day, store_obj=store)
+            parsed = bot.resolve_pinpoint_fail_score(c.text, message_day, store_obj=store)
         if not parsed:
+            parsed_fail += 1
+            continue
+
+        effective_day = day_resolver.resolve(message_day, parsed)
+        if effective_day != day:
             parsed_fail += 1
             continue
 
@@ -461,7 +481,7 @@ def main():
         if args.dry_run:
             continue
 
-        upserts.append((day, c.user_id, parsed, c.slack_ts, c.text))
+        upserts.append((effective_day, c.user_id, parsed, c.slack_ts, c.text))
 
         # Optionally log a synthetic event so reconcile_day can replay it too
         if not args.no_log_events:
@@ -499,21 +519,29 @@ def main():
         print("DRY RUN: no Sheets changes were made.")
         return
 
-    if args.no_reconcile:
+    replay_events = not args.no_reconcile and not args.no_log_events
+    if not replay_events and not args.finalize:
+        if args.no_log_events:
+            print("Reconcile skipped: --no-log-events prevents history entries from being replayed via Events.")
         return
-    if args.no_log_events:
-        print("Reconcile skipped: --no-log-events prevents history entries from being replayed via Events.")
-        return
+
+    if args.no_reconcile and args.finalize:
+        print("Event replay skipped: --no-reconcile was requested.")
+    elif args.no_log_events and args.finalize:
+        print("Event replay skipped: --no-log-events prevents history entries from being replayed via Events.")
 
     rebuilt, status = reconcile_day.run_reconcile(
         bot=bot,
         day=day,
-        post=bool(args.finalize),
+        post=bool(args.post),
         channel=channel,
         source_channel=channel,
         sync_slack_history=False,
+        finalize=bool(args.finalize),
+        replay_events=replay_events,
     )
-    print(f"Reconcile rebuilt/updated from Events: {rebuilt}")
+    if replay_events:
+        print(f"Reconcile rebuilt/updated from Events: {rebuilt}")
     if args.finalize:
         print(f"Finalize status: {status}")
     else:

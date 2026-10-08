@@ -158,7 +158,22 @@ For scores missed while offline:
 ```sh
 python scan_slack_day.py 2026-10-07 --dry-run
 python scan_slack_day.py 2026-10-07 --finalize
+python scan_slack_day.py 2026-10-07 --finalize --no-post
 ```
+
+| Recovery command | Scores/Events | DailyResults/Totals | Slack delivery |
+| --- | --- | --- | --- |
+| `scan_slack_day.py DAY --dry-run` | Preview only | No | No |
+| `scan_slack_day.py DAY` | Backfill and replay | No | No |
+| `scan_slack_day.py DAY --finalize` | Backfill and replay | Finalize if ready | On successful finalization |
+| `scan_slack_day.py DAY --finalize --no-post` | Backfill and replay | Finalize if ready | No |
+| `reconcile_day.py DAY --no-post` | Replay and history sync | Finalize if ready | No |
+
+`--no-reconcile` and `--no-log-events` skip event replay during a scan;
+an explicit `--finalize` still requests finalization of the backfilled scores.
+`--force-finalize` recalculates an existing daily ledger, while `--force-repost`
+only sends standings again. An explicit `--force-finalize` takes precedence
+when both are supplied. `--no-post` suppresses delivery in either case.
 
 `--dry-run` previews score changes, but startup can still create sheets/headers.
 Backfills scan thread parents from a two-day lookback and include two days of

@@ -336,13 +336,17 @@ def bump_day_if_future_puzzle(day: str, parsed: Any, store_obj: Optional[Any] = 
     if not store_obj:
         return day
 
+    get_posted_days = getattr(store_obj, "get_posted_days_snapshot", None)
+    if not callable(get_posted_days):
+        return day
+
     try:
         incoming_pid = int(parsed.puzzle_id)
     except Exception:
         return day
 
     cur = day
-    posted_days = store_obj.get_posted_days_snapshot(force_refresh=False)
+    posted_days = get_posted_days(force_refresh=False)
     while cur in posted_days:
         p_today = primary_puzzle_id_for_day_game(cur, parsed.game, store_obj=store_obj)
         if p_today is None:
@@ -352,3 +356,98 @@ def bump_day_if_future_puzzle(day: str, parsed: Any, store_obj: Optional[Any] = 
             continue
         break
     return cur
+
+
+def resolve_score_day(message_day: str, parsed: Any, store_obj: Optional[Any] = None) -> str:
+    """Resolve the day bucket for a parsed score.
+
+    A native date embedded in the score is authoritative. Scores without one
+    use the message timestamp's day, adjusted forward when a future puzzle is
+    posted after the current day has already been finalized.
+    """
+    explicit_day = getattr(parsed, "score_day", None)
+    if explicit_day:
+        return str(explicit_day)
+    return bump_day_if_future_puzzle(message_day, parsed, store_obj=store_obj)
+
+
+class _CachedScoreDayStore:
+    """Per-run adapter that bounds day-resolution reads during replay/history."""
+
+    def __init__(self, store_obj: Optional[Any]):
+        self._store = store_obj
+        self._posted_days: Optional[Set[str]] = None
+        self._scores_by_day: Optional[Dict[str, List[Dict[str, Any]]]] = None
+        self._scores_by_day_fallback: Dict[str, List[Dict[str, Any]]] = {}
+
+    @staticmethod
+    def _canonical_day(day: Any) -> str:
+        raw = str(day or "").strip()
+        parsed = _parse_day_key_loose(raw)
+        return parsed.isoformat() if parsed is not None else raw
+
+    def get_posted_days_snapshot(self, force_refresh: bool = False) -> Set[str]:
+        # One snapshot belongs to this resolver run, even if a later caller
+        # passes force_refresh. The cache is never shared across instances.
+        if self._posted_days is None:
+            getter = getattr(self._store, "get_posted_days_snapshot", None)
+            posted = getter(force_refresh=False) if callable(getter) else []
+            self._posted_days = {self._canonical_day(day) for day in (posted or []) if self._canonical_day(day)}
+        return set(self._posted_days)
+
+    def _load_score_snapshot(self) -> None:
+        if self._scores_by_day is not None:
+            return
+        scores = getattr(self._store, "scores", None)
+        getter = getattr(scores, "get_all_values", None)
+        if not callable(getter):
+            return
+
+        rows = getter()  # Deliberately propagate provider/read errors to caller.
+        scores_by_day: Dict[str, List[Dict[str, Any]]] = {}
+        if len(rows) <= 1:
+            self._scores_by_day = scores_by_day
+            return
+        header = rows[0]
+        if "day" not in header:
+            self._scores_by_day = scores_by_day
+            return
+        day_i = header.index("day")
+        for row in rows[1:]:
+            raw_day = row[day_i] if len(row) > day_i else ""
+            normalized_day = self._canonical_day(raw_day)
+            if not normalized_day:
+                continue
+            record = {header[i]: (row[i] if i < len(row) else "") for i in range(len(header))}
+            record["day"] = normalized_day
+            scores_by_day.setdefault(normalized_day, []).append(record)
+        self._scores_by_day = scores_by_day
+
+    def load_scores_for_day(self, day: str) -> List[dict]:
+        normalized_day = self._canonical_day(day)
+        scores = getattr(self._store, "scores", None)
+        if callable(getattr(scores, "get_all_values", None)):
+            self._load_score_snapshot()
+            return [dict(record) for record in self._scores_by_day.get(normalized_day, [])]
+
+        # Minimal stores used by scripts/tests may expose only the day loader.
+        # Keep that fallback bounded to one read for each requested day.
+        if normalized_day not in self._scores_by_day_fallback:
+            loader = getattr(self._store, "load_scores_for_day", None)
+            records = loader(day) if callable(loader) else []
+            self._scores_by_day_fallback[normalized_day] = list(records or [])
+        return [dict(record) for record in self._scores_by_day_fallback[normalized_day]]
+
+
+class ScoreDayResolver:
+    """Resolve score days with caches scoped to one replay/history run.
+
+    Reuse one instance across candidates and writes in that run. Live message
+    handling can continue to call :func:`resolve_score_day` directly.
+    """
+
+    def __init__(self, store_obj: Optional[Any] = None):
+        self._store = _CachedScoreDayStore(store_obj)
+
+    def resolve(self, message_day: str, parsed: Any) -> str:
+        return resolve_score_day(message_day, parsed, store_obj=self._store)

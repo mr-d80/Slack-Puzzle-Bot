@@ -15,6 +15,7 @@ from awards import (
 )
 from game_registry import game_registry
 from parser import normalize_game, canonical_user_id, _parse_tiebreak
+from score_identity import score_identity
 from score_metrics import metric_sort_value, record_is_dnf, metric_unit
 
 
@@ -105,6 +106,27 @@ def _day_of_records(records: List[Dict[str, Any]]) -> Optional[str]:
     return days.pop() if len(days) == 1 else None
 
 
+def _deduplicate_score_records(records: List[Dict[str, Any]], day: Optional[str] = None) -> List[Dict[str, Any]]:
+    """Keep the last row for each (day, user, game, puzzle) score identity."""
+    last_index_by_key: Dict[Tuple[str, str, str, str], int] = {}
+    keys: List[Optional[Tuple[str, str, str, str]]] = []
+    for index, record in enumerate(records):
+        key = score_identity(
+            record.get("day") or day,
+            record.get("user_id"),
+            record.get("game"),
+            record.get("puzzle_id"),
+        )
+        keys.append(key)
+        if key is not None:
+            last_index_by_key[key] = index
+
+    return [
+        record for index, record in enumerate(records)
+        if keys[index] is None or last_index_by_key[keys[index]] == index
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Daily winner computation
 # ---------------------------------------------------------------------------
@@ -131,6 +153,7 @@ def compute_daily_winners(
 
     Returns (winners_by_game, awards_by_user, best_display).
     """
+    records = _deduplicate_score_records(records, day=day)
     if day is None:
         day = _day_of_records(records)
     if uses_medal_scoring(day):

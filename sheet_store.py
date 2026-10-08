@@ -25,6 +25,7 @@ from day_utils import _parse_day_key_loose
 from game_registry import _DEFAULT_GAMES
 from gsheets_safe import gspread_call, utc_now_iso, truncate_for_cell, spool_jsonl
 from parser import ParsedScore, normalize_game, canonical_user_id
+from score_identity import score_identity
 
 
 logger = logging.getLogger(__name__)
@@ -559,9 +560,48 @@ class SheetStore:
 
     # ---- Scores ----
     @staticmethod
-    def _score_upsert_key(day: str, user_id: str, game: str, puzzle_id: Any) -> Tuple[str, str, str, str]:
+    def _score_upsert_key(day: str, user_id: str, game: str, puzzle_id: Any) -> Optional[Tuple[str, str, str, str]]:
         """Identity of a score row for upsert dedup: (day, user, game, puzzle_id)."""
-        return (day, user_id, normalize_game(game), str(puzzle_id).strip())
+        return score_identity(day, user_id, game, puzzle_id)
+
+    @staticmethod
+    def _score_row_is_newer(
+        candidate: List[str], incumbent: List[str], idx: Dict[str, int],
+    ) -> bool:
+        """Compare score edits using Slack time, then stored update time.
+
+        Sheet order remains the deterministic last-row-wins fallback when the
+        available timestamps cannot distinguish two legacy rows.
+        """
+        def cell(row: List[str], name: str) -> str:
+            pos = idx.get(name, -1)
+            return str(row[pos]).strip() if 0 <= pos < len(row) else ""
+
+        def slack_time(row: List[str]) -> Optional[float]:
+            try:
+                return float(cell(row, "slack_ts"))
+            except (TypeError, ValueError):
+                return None
+
+        def update_time(row: List[str]) -> Optional[float]:
+            raw = cell(row, "updated_at")
+            if not raw:
+                return None
+            try:
+                return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        candidate_slack = slack_time(candidate)
+        incumbent_slack = slack_time(incumbent)
+        if candidate_slack is not None and incumbent_slack is not None and candidate_slack != incumbent_slack:
+            return candidate_slack > incumbent_slack
+
+        candidate_updated = update_time(candidate)
+        incumbent_updated = update_time(incumbent)
+        if candidate_updated is not None and incumbent_updated is not None and candidate_updated != incumbent_updated:
+            return candidate_updated > incumbent_updated
+        return True  # Equal or incomparable timestamps: the later sheet row wins.
 
     def _build_score_row(
         self, header: List[str], idx: Dict[str, int],
@@ -598,29 +638,40 @@ class SheetStore:
         header = rows[0]
         idx = {name: header.index(name) for name in header if name in header}
 
-        # Find existing row by (day, user_id, game, puzzle_id)
-        target_row = None
+        # Last legacy occurrence wins; collapse any older duplicate rows for
+        # this identity while updating the survivor in place.
+        matching_rows: List[int] = []
         if all(k in idx for k in ("day", "user_id", "game", "puzzle_id")):
             want = self._score_upsert_key(day, user_id, parsed.game, parsed.puzzle_id)
             for r_i in range(1, len(rows)):
                 r = rows[r_i]
                 try:
-                    if self._score_upsert_key(
+                    key = self._score_upsert_key(
                         r[idx["day"]], r[idx["user_id"]], r[idx["game"]], r[idx["puzzle_id"]]
-                    ) == want:
-                        target_row = r_i + 1  # 1-based
-                        break
+                    )
+                    if want is not None and key == want:
+                        matching_rows.append(r_i + 1)  # 1-based
                 except Exception:
                     continue
 
         row_vals = self._build_score_row(header, idx, day, user_id, parsed, slack_ts, raw_text)
 
-        if target_row is None:
+        if not matching_rows:
             self.scores.append_row(row_vals, value_input_option="RAW")
         else:
-            start = gspread.utils.rowcol_to_a1(target_row, 1)
-            end = gspread.utils.rowcol_to_a1(target_row, len(header))
-            self.scores.update(values=[row_vals], range_name=f"{start}:{end}")
+            target_row = matching_rows[-1]
+            if len(matching_rows) == 1:
+                start = gspread.utils.rowcol_to_a1(target_row, 1)
+                end = gspread.utils.rowcol_to_a1(target_row, len(header))
+                self.scores.update(values=[row_vals], range_name=f"{start}:{end}")
+                return
+            writes = []
+            for row_num in [*matching_rows[:-1], target_row]:
+                start = gspread.utils.rowcol_to_a1(row_num, 1)
+                end = gspread.utils.rowcol_to_a1(row_num, len(header))
+                values = [row_vals] if row_num == target_row else [[""] * len(header)]
+                writes.append({"range": f"{start}:{end}", "values": values})
+            self.scores.batch_update(writes, value_input_option="RAW")
 
     def upsert_score(self, day: str, user_id: str, parsed: ParsedScore, slack_ts: str, raw_text: str) -> None:
         self._write_with_backoff(
@@ -658,8 +709,9 @@ class SheetStore:
             ncols = len(header)
             have_key_cols = all(k in idx for k in ("day", "user_id", "game", "puzzle_id"))
 
-            # Map existing identity -> 1-based row number.
-            existing_by_key: Dict[Tuple[str, str, str, str], int] = {}
+            # Map identity -> all 1-based rows; for a touched legacy duplicate,
+            # the last occurrence survives and older duplicates are cleared.
+            existing_by_key: Dict[Tuple[str, str, str, str], List[int]] = {}
             if have_key_cols:
                 for r_i in range(1, len(rows)):
                     r = rows[r_i]
@@ -669,12 +721,14 @@ class SheetStore:
                         )
                     except Exception:
                         continue
-                    existing_by_key[key] = r_i + 1  # last occurrence wins, mirrors single-upsert
+                    if key is not None:
+                        existing_by_key.setdefault(key, []).append(r_i + 1)
 
             # Accumulate edits keyed by row number so repeats within the batch
             # collapse onto one write; new rows are appended in arrival order,
             # but a later upsert of the same new identity overwrites the earlier.
             updates_by_row: Dict[int, List[str]] = {}
+            duplicate_rows_to_clear: Set[int] = set()
             appends: List[List[str]] = []
             append_pos_by_key: Dict[Tuple[str, str, str, str], int] = {}
             applied = 0
@@ -685,7 +739,9 @@ class SheetStore:
 
                 applied += 1
                 if key is not None and key in existing_by_key:
-                    updates_by_row[existing_by_key[key]] = row_vals
+                    matches = existing_by_key[key]
+                    updates_by_row[matches[-1]] = row_vals
+                    duplicate_rows_to_clear.update(matches[:-1])
                 elif key is not None and key in append_pos_by_key:
                     appends[append_pos_by_key[key]] = row_vals
                 else:
@@ -696,10 +752,21 @@ class SheetStore:
             # One batch_update for all in-place edits.
             if updates_by_row:
                 data = []
-                for row_num, row_vals in updates_by_row.items():
+                for row_num, row_vals in sorted(updates_by_row.items()):
                     start = gspread.utils.rowcol_to_a1(row_num, 1)
                     end = gspread.utils.rowcol_to_a1(row_num, ncols)
                     data.append({"range": f"{start}:{end}", "values": [row_vals]})
+                for row_num in sorted(duplicate_rows_to_clear):
+                    start = gspread.utils.rowcol_to_a1(row_num, 1)
+                    end = gspread.utils.rowcol_to_a1(row_num, ncols)
+                    data.append({"range": f"{start}:{end}", "values": [[""] * ncols]})
+                self.scores.batch_update(data, value_input_option="RAW")
+            elif duplicate_rows_to_clear:
+                data = []
+                for row_num in sorted(duplicate_rows_to_clear):
+                    start = gspread.utils.rowcol_to_a1(row_num, 1)
+                    end = gspread.utils.rowcol_to_a1(row_num, ncols)
+                    data.append({"range": f"{start}:{end}", "values": [[""] * ncols]})
                 self.scores.batch_update(data, value_input_option="RAW")
 
             # One append_rows for all new rows.
@@ -741,40 +808,91 @@ class SheetStore:
         uid_i = idx['user_id']
         game_i = idx['game']
         pid_i = idx['puzzle_id']
-        ts_i = idx.get('slack_ts', -1)
-        upd_i = idx.get('updated_at', -1)
 
-        target_row = None
+        source_rows: List[int] = []
+        destination_rows: List[int] = []
+        source_identity = self._score_upsert_key(old_day, user_id, game, puzzle_id)
+        destination_identity = self._score_upsert_key(new_day, user_id, game, puzzle_id)
         for r_i in range(1, len(rows)):
             r = rows[r_i]
             try:
-                if (
-                    (r[day_i] if len(r) > day_i else '') == old_day
-                    and (r[uid_i] if len(r) > uid_i else '') == user_id
-                    and normalize_game(r[game_i] if len(r) > game_i else '') == normalize_game(game)
-                    and str(r[pid_i] if len(r) > pid_i else '').strip() == str(puzzle_id)
-                ):
-                    if slack_ts and ts_i >= 0:
-                        if str(r[ts_i] if len(r) > ts_i else '').strip() != str(slack_ts).strip():
-                            continue
-                    target_row = r_i + 1
-                    break
+                key = self._score_upsert_key(
+                    r[day_i] if len(r) > day_i else '',
+                    r[uid_i] if len(r) > uid_i else '',
+                    r[game_i] if len(r) > game_i else '',
+                    r[pid_i] if len(r) > pid_i else '',
+                )
+                if key is None or source_identity is None or key[1:] != source_identity[1:]:
+                    continue
+                if key[0] == source_identity[0]:
+                    source_rows.append(r_i + 1)
+                elif destination_identity is not None and key[0] == destination_identity[0]:
+                    destination_rows.append(r_i + 1)
             except Exception:
                 continue
 
-        if target_row is None:
+        if not source_rows:
             return False
+
+        if slack_ts:
+            slack_i = idx.get('slack_ts', -1)
+            if slack_i >= 0 and not any(
+                str(rows[row_num - 1][slack_i] if len(rows[row_num - 1]) > slack_i else '').strip()
+                == str(slack_ts).strip()
+                for row_num in source_rows
+            ):
+                return False
 
         # Do not move into a day that's already been posted (would change history).
         if self.day_already_posted(new_day):
             return False
 
-        now = datetime.now(TZ).isoformat()
-        day_cell = gspread.utils.rowcol_to_a1(target_row, day_i + 1)
-        self.scores.update(values=[[new_day]], range_name=day_cell)
-        if upd_i >= 0:
-            upd_cell = gspread.utils.rowcol_to_a1(target_row, upd_i + 1)
-            self.scores.update(values=[[now]], range_name=upd_cell)
+        # Legacy duplicates within each bucket use last-row-wins. Across the
+        # source and destination buckets, prefer a distinguishably newer Slack
+        # message; equal Slack timestamps favor destination because replay can
+        # refresh updated_at without proving that its score is a newer edit.
+        candidates = sorted(source_rows + destination_rows)
+        source_winner = source_rows[-1]
+        if destination_rows:
+            destination_winner = destination_rows[-1]
+            source_row = rows[source_winner - 1]
+            destination_row = rows[destination_winner - 1]
+            slack_i = idx.get('slack_ts', -1)
+            source_slack = str(source_row[slack_i]).strip() if slack_i >= 0 and len(source_row) > slack_i else ''
+            destination_slack = str(destination_row[slack_i]).strip() if slack_i >= 0 and len(destination_row) > slack_i else ''
+            try:
+                source_slack_time = float(source_slack)
+                destination_slack_time = float(destination_slack)
+            except (TypeError, ValueError):
+                source_slack_time = destination_slack_time = None
+
+            if source_slack and source_slack == destination_slack:
+                winner = destination_winner
+            elif (
+                source_slack_time is not None
+                and destination_slack_time is not None
+            ):
+                if source_slack_time == destination_slack_time:
+                    winner = destination_winner
+                else:
+                    winner = source_winner if source_slack_time > destination_slack_time else destination_winner
+            else:
+                winner = source_winner if self._score_row_is_newer(source_row, destination_row, idx) else destination_winner
+        else:
+            winner = source_winner
+
+        merged = list(rows[winner - 1])
+        if len(merged) < len(header):
+            merged.extend([""] * (len(header) - len(merged)))
+        merged[day_i] = new_day
+
+        writes = []
+        for row_num in candidates:
+            start = gspread.utils.rowcol_to_a1(row_num, 1)
+            end = gspread.utils.rowcol_to_a1(row_num, len(header))
+            values = [merged] if row_num == winner else [[""] * len(header)]
+            writes.append({"range": f"{start}:{end}", "values": values})
+        self.scores.batch_update(writes, value_input_option="RAW")
         return True
 
     def move_score_day(
