@@ -20,6 +20,8 @@
 - Serialize direct daily finalizers, honor lost storage claims, and stop
   concurrent recap commands before duplicate delivery. Recap-only and
   no-recap options apply per call without changing global delivery settings.
+- Remove unused legacy query executors and use production credential-path
+  resolution in the natural-language smoke harness.
 
 ### Experimental game support
 - Added opt-in native daily-share parsing for Wordle, 4×6, 4×3, and MapTap.

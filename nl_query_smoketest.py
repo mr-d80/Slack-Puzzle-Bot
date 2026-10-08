@@ -41,8 +41,10 @@ def _build_store():
       SPREADSHEET_ID
       GOOGLE_SERVICE_ACCOUNT_FILE
     """
-    sid = (os.environ.get("SPREADSHEET_ID") or "").strip()
-    sa = (os.environ.get("GOOGLE_SERVICE_ACCOUNT_FILE") or "").strip()
+    from config import SPREADSHEET_ID, GOOGLE_SA_FILE
+
+    sid = SPREADSHEET_ID.strip()
+    sa = GOOGLE_SA_FILE.strip()
     if not sid or not sa:
         raise RuntimeError("Missing SPREADSHEET_ID or GOOGLE_SERVICE_ACCOUNT_FILE (needed for full pipeline).")
 

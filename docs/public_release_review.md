@@ -110,3 +110,7 @@ than overwritten. Live game/provider integrations remain untested.
 The score-identity/CLI phase passed **380 tests and 21 subtests**. The integrated
 ranking, ledger-contract, and finalization phase passed **413 tests and 29
 subtests**, with independent review after the compatibility fixes.
+After removing the eleven unused query helpers, the final integrated suite
+also passed **413 tests and 29 subtests**. Python 3.10 grammar and source
+credential-pattern checks passed; the smoke harness credential-path check
+used fake services from outside the checkout.

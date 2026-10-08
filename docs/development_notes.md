@@ -1,5 +1,15 @@
 # Development Notes
 
+## 2026-10-08 public repository cleanup
+
+- Removed the eleven unused NL query helpers, including the older executors
+  described as retained in the historical notes below. Live placement and
+  consistency helpers remain.
+- Shared score identities, rankings, ledger payloads, and finalization claims
+  are documented in [Architecture and data contracts](architecture.md).
+- The final integrated suite passed **413 tests and 29 subtests**. Experimental
+  game integrations remain untested with real Slack submissions.
+
 ## 2026-04-08
 
 - Preserve the AI rewrite for daily recaps, but make required facts explicit in the prompt and allow one AI revision pass if a mandatory callout is missing.
