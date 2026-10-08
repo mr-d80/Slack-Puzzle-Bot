@@ -24,6 +24,7 @@ from typing import Any, Dict, Optional, Tuple
 import sys
 import types
 
+from day_utils import ScoreDayResolver
 from slack_safe import message_ts
 
 
@@ -101,7 +102,13 @@ def _extract_message_fields(payload: Dict[str, Any]) -> Optional[Tuple[str, str,
     return channel, user_id, slack_ts, text
 
 
-def replay_events_for_day(bot_module: Any, day: str, source_channel: str = "") -> int:
+def replay_events_for_day(
+    bot_module: Any,
+    day: str,
+    source_channel: str = "",
+    *,
+    day_resolver: Optional[ScoreDayResolver] = None,
+) -> int:
     """Re-parse all Events for *day* through the current parse_score() and upsert.
 
     Returns the number of score rows rebuilt/updated.
@@ -114,6 +121,7 @@ def replay_events_for_day(bot_module: Any, day: str, source_channel: str = "") -
         raise ValueError("A source channel must be provided or configured before replaying Events.")
 
     store = bot_module.store
+    day_resolver = day_resolver or ScoreDayResolver(store)
     ev_rows = store.events.get_all_values()
     if len(ev_rows) <= 1:
         return 0
@@ -151,15 +159,15 @@ def replay_events_for_day(bot_module: Any, day: str, source_channel: str = "") -
         parsed_day = bot_module.day_key_from_ts(slack_ts)
         parse_for_day = getattr(bot_module, "parse_score_for_day", None)
         parsed = parse_for_day(text, parsed_day) if callable(parse_for_day) else bot_module.parse_score(text)
-        effective_day = getattr(parsed, "score_day", None) or parsed_day
-        if effective_day != day:
-            continue
         if not parsed:
-            parsed = bot_module.resolve_pinpoint_fail_score(text, day, store_obj=store)
+            parsed = bot_module.resolve_pinpoint_fail_score(text, parsed_day, store_obj=store)
         if not parsed:
             continue
 
-        upserts.append((day, user_id, parsed, slack_ts, text))
+        effective_day = day_resolver.resolve(parsed_day, parsed)
+        if effective_day != day:
+            continue
+        upserts.append((effective_day, user_id, parsed, slack_ts, text))
 
     return store.bulk_upsert_scores(upserts)
 
@@ -191,12 +199,14 @@ def run_reconcile(
     channel: str = "",
     source_channel: str = "",
     force_repost: bool = False,
-    recap: bool = True,
+    recap: Optional[bool] = None,
     recap_only: bool = False,
     ai: Optional[bool] = None,
     recap_style: str = "",
     force_finalize: bool = False,
     sync_slack_history: bool = True,
+    finalize: bool = True,
+    replay_events: bool = True,
 ) -> Tuple[int, str]:
     store = bot.store
 
@@ -209,21 +219,18 @@ def run_reconcile(
         os.environ["AI_RECAP_STYLE"] = recap_style
 
     if recap_only:
-        os.environ["POST_DAILY_SCORES"] = "0"
-        os.environ["POST_DAILY_RECAP"] = "1"
         recap = True
-        try:
-            setattr(bot, "POST_DAILY_SCORES", False)
-        except Exception:
-            pass
-        try:
-            setattr(bot, "POST_DAILY_RECAP", True)
-        except Exception:
-            pass
+    effective_recap = (
+        bool(getattr(bot, "POST_DAILY_RECAP", True))
+        if recap is None else bool(recap)
+    )
 
-    rebuilt = replay_events_for_day(bot, day, source_channel=source_channel)
+    rebuilt = replay_events_for_day(bot, day, source_channel=source_channel) if replay_events else 0
     if sync_slack_history:
         rebuilt += sync_slack_history_for_day(bot, day, source_channel=source_channel)
+
+    if not finalize:
+        return rebuilt, f"Replayed {day}; finalization skipped."
 
     def _post_standings_only(channel_id: str) -> str:
         records = store.load_scores_for_day(day)
@@ -250,7 +257,7 @@ def run_reconcile(
             msg = bot.format_summary(day, winners_by_game, awards_by_user, totals_map, best_display, players=players)
             day_msg_ts = message_ts(bot.client.chat_postMessage(channel=channel_id, text=msg))
 
-        if recap:
+        if effective_recap:
             try:
                 expected = bot.expected_players_for_day(day)
             except Exception:
@@ -283,7 +290,7 @@ def run_reconcile(
                 if patched_load_totals and callable(orig_load_totals):
                     store.load_totals_map = orig_load_totals  # type: ignore[assignment]
 
-            post_recap = bool(getattr(bot, "POST_DAILY_RECAP", True))
+            post_recap = effective_recap
             in_thread = bool(getattr(bot, "DAILY_RECAP_IN_THREAD", True))
             if post_recap and recap_text.strip():
                 if in_thread and day_msg_ts:
@@ -301,19 +308,24 @@ def run_reconcile(
             return rebuilt, "Could not determine channel to post into (pass --channel or set SCORE_CHANNEL_ID)."
 
         already_posted = store.day_already_posted(day)
-        if already_posted and (force_repost or bool(channel.strip())):
+        if already_posted and not force_finalize and (force_repost or recap_only or bool(channel.strip())):
             return rebuilt, _post_standings_only(channel_to_post)
 
-        status = bot.finalize_day(day, channel_to_post, post=True, force=bool(force_finalize))
+        status = bot.finalize_day(
+            day,
+            channel_to_post,
+            post=True,
+            force=bool(force_finalize),
+            post_scores=not recap_only,
+            post_recap=effective_recap,
+        )
         return rebuilt, status
 
-    status = bot.finalize_day(day, channel="", post=False)
+    status = bot.finalize_day(day, channel="", post=False, force=bool(force_finalize))
     return rebuilt, status
 
 
 def main():
-    bot = _load_bot_module()
-
     ap = argparse.ArgumentParser()
     ap.add_argument("day", help="YYYY-MM-DD (SCORE_DAY_TZ, default GMT-12 / Etc/GMT+12)")
     ap.add_argument("--no-post", dest="post", action="store_false", help="Do not post to Slack")
@@ -332,12 +344,12 @@ def main():
         "--no-recap",
         dest="recap",
         action="store_false",
-        help="When re-posting (force-repost), do not post the recap message.",
+        help="Do not post the recap message.",
     )
     ap.add_argument(
         "--recap-only",
         action="store_true",
-        help="Post only the recap (no standings/scores message). Sets POST_DAILY_SCORES=0 and POST_DAILY_RECAP=1 for this run.",
+        help="Post only the recap (no standings/scores message).",
     )
     ap.add_argument(
         "--ai",
@@ -363,9 +375,11 @@ def main():
         help="Force finalization even if the day isn't 'ready' (still respects day boundary logic).",
     )
     ap.set_defaults(post=True)
-    ap.set_defaults(recap=True)
+    ap.set_defaults(recap=None)
     ap.set_defaults(ai=None)
     args = ap.parse_args()
+
+    bot = _load_bot_module()
 
     rebuilt, status = run_reconcile(
         bot=bot,
@@ -374,7 +388,7 @@ def main():
         channel=args.channel,
         source_channel=(args.source_channel or ""),
         force_repost=bool(args.force_repost),
-        recap=bool(args.recap),
+        recap=args.recap,
         recap_only=bool(args.recap_only),
         ai=args.ai,
         recap_style=args.recap_style,

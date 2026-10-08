@@ -2,6 +2,27 @@
 
 ## Unreleased
 
+### Repository review fixes
+- Share score-day resolution across live ingestion, Events replay, and history
+  recovery. Recovery uses one run-local score snapshot and reports read errors.
+- Merge duplicate score identities consistently during upserts and day moves;
+  filter legacy duplicate rows before scoring or statistics so a submission
+  cannot earn duplicate medals.
+- Separate recovery replay, ledger finalization, and Slack posting controls.
+  Scan requires `--finalize` for ledger changes and honors `--no-post`;
+  CLI help no longer initializes Slack/Sheets services.
+- Use the scorer's tiebreak rankings in placements and recap facts. Read
+  monthly titles through the same versioned payload contract as the writer,
+  with support for historical flat records.
+- Store complete, size-checked JSON; spool oversized Events and reject
+  oversized ledger writes. Preserve existing malformed summaries when a
+  timestamp patch cannot decode them.
+- Serialize direct daily finalizers, honor lost storage claims, and stop
+  concurrent recap commands before duplicate delivery. Recap-only and
+  no-recap options apply per call without changing global delivery settings.
+- Remove unused legacy query executors and use production credential-path
+  resolution in the natural-language smoke harness.
+
 ### Experimental game support
 - Added opt-in native daily-share parsing for Wordle, 4×6, 4×3, and MapTap.
   These implementations remain untested with real Slack submissions; automated

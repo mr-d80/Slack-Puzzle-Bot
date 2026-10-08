@@ -1,5 +1,9 @@
 # Contributing
 
+See [Architecture and data contracts](docs/architecture.md) before changing
+ingestion, scoring, or ledger behavior. Keep shared rules in their owning
+module and verify agreement between writers and readers.
+
 Please open an issue describing the problem or proposed change before a large
 refactor. Include Python version, operating system, and a minimal example with
 fake user IDs and scores. Never attach credentials, live event payloads, or

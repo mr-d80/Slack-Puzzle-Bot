@@ -15,6 +15,7 @@ from awards import (
 )
 from game_registry import game_registry
 from parser import normalize_game, canonical_user_id, _parse_tiebreak
+from score_identity import deduplicate_score_records as _deduplicate_score_records
 from score_metrics import metric_sort_value, record_is_dnf, metric_unit
 
 
@@ -131,6 +132,7 @@ def compute_daily_winners(
 
     Returns (winners_by_game, awards_by_user, best_display).
     """
+    records = _deduplicate_score_records(records, day=day)
     if day is None:
         day = _day_of_records(records)
     if uses_medal_scoring(day):

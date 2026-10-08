@@ -23,6 +23,16 @@ class Rows:
         self.rows.append(row)
 
 
+class CountingRows(Rows):
+    def __init__(self, rows):
+        super().__init__(rows)
+        self.reads = 0
+
+    def get_all_values(self):
+        self.reads += 1
+        return self.rows
+
+
 class NewGameIngestionTests(unittest.TestCase):
     def setUp(self):
         self.games_patch = patch.object(game_registry, "games", game_registry.games_as_tuples() + list(_OPTIONAL_GAMES))
@@ -54,6 +64,156 @@ class NewGameIngestionTests(unittest.TestCase):
         self.assertEqual(writes[0][2].metric_value, 938)
         self.assertEqual(writes[0][2].status, "solved")
         self.assertEqual(reconcile_day.replay_events_for_day(bot, "2026-10-09"), 0)
+
+    def make_posted_wordle_bot(self, parsed):
+        text = "Wordle #1,235 - 4/6"
+        payload = {"event": {"channel": "C1", "user": "U1", "ts": "1.0", "text": text}}
+        writes = []
+        store = SimpleNamespace(
+            events=Rows([["event_id", "payload_json"], ["E1", json.dumps(payload)]]),
+            get_posted_days_snapshot=lambda force_refresh=False: {"2026-10-08"},
+            load_scores_for_day=lambda day: (
+                [{"user_id": "U0", "game": "Wordle", "puzzle_id": "1234"}]
+                if day == "2026-10-08" else []
+            ),
+            bulk_upsert_scores=lambda rows: writes.extend(rows) or len(rows),
+            bulk_log_events=lambda _rows: None,
+            seen_event=lambda _event_id: False,
+        )
+        bot = SimpleNamespace(
+            store=store,
+            SCORE_CHANNEL_ID="C1",
+            parse_score_for_day=lambda _text, _day: parsed,
+            day_key_from_ts=lambda _ts: "2026-10-08",
+            resolve_pinpoint_fail_score=lambda *_args, **_kwargs: None,
+        )
+        return bot, writes, {"user": "U1", "ts": "1.0", "text": text}
+
+    def test_future_puzzle_resolution_matches_replay_and_history_upserts(self):
+        parsed = SimpleNamespace(
+            game="Wordle", puzzle_id=1235, metric_type="guesses", metric_value=4,
+            display="4/6", status="solved", score_day=None,
+        )
+        bot, replay_writes, message = self.make_posted_wordle_bot(parsed)
+
+        self.assertEqual(reconcile_day.replay_events_for_day(bot, "2026-10-08"), 0)
+        self.assertEqual(reconcile_day.replay_events_for_day(bot, "2026-10-09"), 1)
+        self.assertEqual(replay_writes[0][0], "2026-10-09")
+        self.assertEqual(scan_slack_day._extract_candidates(bot, "C1", [message], "2026-10-08"), [])
+        self.assertEqual(len(scan_slack_day._extract_candidates(bot, "C1", [message], "2026-10-09")), 1)
+
+        bot, history_writes, message = self.make_posted_wordle_bot(parsed)
+        with patch.object(scan_slack_day, "_day_window_utc", return_value=(100, 200)):
+            with patch.object(scan_slack_day, "_fetch_channel_messages", return_value=[message]):
+                self.assertEqual(
+                    scan_slack_day.sync_slack_history_for_day(
+                        bot, "2026-10-09", "C1", log_events=False
+                    ),
+                    1,
+                )
+        self.assertEqual(history_writes[0][0], "2026-10-09")
+
+    def test_explicit_score_day_is_authoritative_over_future_puzzle_bump(self):
+        parsed = SimpleNamespace(
+            game="Wordle", puzzle_id=1235, metric_type="guesses", metric_value=4,
+            display="4/6", status="solved", score_day="2026-10-07",
+        )
+        bot, writes, _message = self.make_posted_wordle_bot(parsed)
+
+        self.assertEqual(reconcile_day.replay_events_for_day(bot, "2026-10-07"), 1)
+        self.assertEqual(reconcile_day.replay_events_for_day(bot, "2026-10-08"), 0)
+        self.assertEqual([row[0] for row in writes], ["2026-10-07"])
+
+        bot, history_writes, message = self.make_posted_wordle_bot(parsed)
+        self.assertEqual(len(scan_slack_day._extract_candidates(bot, "C1", [message], "2026-10-07")), 1)
+        self.assertEqual(scan_slack_day._extract_candidates(bot, "C1", [message], "2026-10-08"), [])
+        with patch.object(scan_slack_day, "_day_window_utc", return_value=(100, 200)):
+            with patch.object(scan_slack_day, "_fetch_channel_messages", return_value=[message]):
+                self.assertEqual(
+                    scan_slack_day.sync_slack_history_for_day(
+                        bot, "2026-10-07", "C1", log_events=False
+                    ),
+                    1,
+                )
+        self.assertEqual(history_writes[0][0], "2026-10-07")
+
+    def make_multi_day_resolver_bot(self):
+        payloads = [
+            {"event": {"channel": "C1", "user": f"U{i}", "ts": ts, "text": "future puzzle"}}
+            for i, ts in enumerate(("8.0", "9.0"), start=1)
+        ]
+        score_rows = CountingRows([
+            list(SheetStore.REQUIRED_SCORES_COLS),
+            ["2026-10-08", "U0", "Wordle", "1234", "guesses", "4", "4/6", "", "", "", "", "solved"],
+            ["2026-10-09", "U0", "Wordle", "1235", "guesses", "4", "4/6", "", "", "", "", "solved"],
+        ])
+        writes = []
+        store = SimpleNamespace(
+            events=Rows([["event_id", "payload_json"]] + [[str(i), json.dumps(p)] for i, p in enumerate(payloads)]),
+            scores=score_rows,
+            get_posted_days_snapshot=lambda force_refresh=False: {"2026-10-08", "2026-10-09"},
+            load_scores_for_day=lambda _day: [],
+            bulk_upsert_scores=lambda rows: writes.extend(rows) or len(rows),
+            bulk_log_events=lambda _rows: None,
+            seen_event=lambda _event_id: False,
+        )
+        parsed = SimpleNamespace(
+            game="Wordle", puzzle_id=1236, metric_type="guesses", metric_value=4,
+            display="4/6", status="solved", score_day=None,
+        )
+        message_days = {"8.0": "2026-10-08", "9.0": "2026-10-09"}
+        bot = SimpleNamespace(
+            store=store,
+            SCORE_CHANNEL_ID="C1",
+            parse_score_for_day=lambda _text, _day: parsed,
+            day_key_from_ts=lambda ts: message_days[ts],
+            resolve_pinpoint_fail_score=lambda *_args, **_kwargs: None,
+            normalize_game=lambda game: game,
+        )
+        messages = [
+            {"user": f"U{i}", "ts": ts, "text": "future puzzle"}
+            for i, ts in enumerate(("8.0", "9.0"), start=1)
+        ]
+        return bot, writes, score_rows, messages
+
+    def test_replay_and_history_share_one_score_sheet_snapshot_per_run(self):
+        bot, replay_writes, score_rows, messages = self.make_multi_day_resolver_bot()
+
+        self.assertEqual(reconcile_day.replay_events_for_day(bot, "2026-10-10"), 2)
+        self.assertEqual([row[0] for row in replay_writes], ["2026-10-10", "2026-10-10"])
+        self.assertEqual(score_rows.reads, 1)
+
+        bot, history_writes, score_rows, messages = self.make_multi_day_resolver_bot()
+        with patch.object(scan_slack_day, "_day_window_utc", return_value=(100, 200)):
+            with patch.object(scan_slack_day, "_fetch_channel_messages", return_value=messages):
+                self.assertEqual(
+                    scan_slack_day.sync_slack_history_for_day(
+                        bot, "2026-10-10", "C1", log_events=False
+                    ),
+                    2,
+                )
+        self.assertEqual([row[0] for row in history_writes], ["2026-10-10", "2026-10-10"])
+        self.assertEqual(score_rows.reads, 1)
+
+    def test_scan_cli_reuses_resolver_between_candidate_filter_and_upsert(self):
+        bot, writes, score_rows, messages = self.make_multi_day_resolver_bot()
+        with patch("sys.argv", ["scan_slack_day.py", "2026-10-10", "--no-replies", "--no-reconcile"]):
+            with patch.object(scan_slack_day, "_day_window_utc", return_value=(100, 200)):
+                with patch.object(scan_slack_day, "_fetch_channel_messages", return_value=messages):
+                    with patch.object(scan_slack_day, "_load_bot_module", return_value=bot):
+                        scan_slack_day.main()
+
+        self.assertEqual([row[0] for row in writes], ["2026-10-10", "2026-10-10"])
+        self.assertEqual(score_rows.reads, 1)
+
+    def test_history_candidate_filter_propagates_store_read_failure(self):
+        bot, _writes, _score_rows, messages = self.make_multi_day_resolver_bot()
+        bot.store.get_posted_days_snapshot = lambda force_refresh=False: (_ for _ in ()).throw(
+            RuntimeError("posted-days read failed")
+        )
+
+        with self.assertRaisesRegex(RuntimeError, "posted-days read failed"):
+            scan_slack_day._extract_candidates(bot, "C1", messages, "2026-10-10")
 
     def test_history_candidates_use_native_dates_but_keep_timestamp_bucketing_for_zip(self):
         bot, _writes = self.make_bot()

@@ -60,7 +60,7 @@ from day_utils import (
     month_key_for_day, month_bounds, prev_month_key, is_month_closed,
     choose_primary_puzzle_ids, filter_records_to_primary_puzzles,
     expected_players_for_day, count_complete_players,
-    primary_puzzle_id_for_day_game, bump_day_if_future_puzzle,
+    primary_puzzle_id_for_day_game, bump_day_if_future_puzzle, resolve_score_day,
     move_future_puzzle_scores, resolve_pinpoint_fail_score,
 )
 from sheet_store import SheetStore
@@ -92,8 +92,27 @@ def _looks_like_nl_query(text: str) -> bool:
 # (so slash commands and utility scripts can call finalize_day(day, channel)
 # with the same signature as the original monolith).
 # ---------------------------------------------------------------------------
-def finalize_day(day, channel, post=True, force=False, now_utc=None):
-    return _finalize_day_impl(day, channel, store, client, post=post, force=force, now_utc=now_utc)
+def finalize_day(
+    day,
+    channel,
+    post=True,
+    force=False,
+    now_utc=None,
+    *,
+    post_scores=True,
+    post_recap=None,
+):
+    return _finalize_day_impl(
+        day,
+        channel,
+        store,
+        client,
+        post=post,
+        force=force,
+        now_utc=now_utc,
+        post_scores=post_scores,
+        post_recap=post_recap,
+    )
 
 
 def finalize_due_days(channel, post=True):
@@ -253,9 +272,7 @@ def handle_message(body, event, logger):
                 logger.exception(f"NL query failed: {e}")
         return
 
-    day = getattr(parsed, "score_day", None) or message_day
-    if not getattr(parsed, "score_day", None):
-        day = bump_day_if_future_puzzle(day, parsed, store_obj=store)
+    day = resolve_score_day(message_day, parsed, store_obj=store)
 
     try:
         store.upsert_score(day, user_id, parsed, slack_ts, text)

@@ -26,7 +26,10 @@ import hashlib
 from awards import (
     POINTS_BY_PLACE, AwardTally, unpack_awards, uses_medal_scoring, render_tally, format_points,
 )
-from score_metrics import higher_is_better, metric_sort_value, record_is_dnf, metric_unit
+from score_metrics import higher_is_better, record_is_dnf, metric_unit
+from parser import canonical_user_id, normalize_game
+from score_identity import deduplicate_score_records
+from scoring import rank_finishers
 from openai_compat import (
     chat_completion_token_limit_param as _chat_completion_token_limit_param,
     default_reasoning_effort as _default_reasoning_effort,
@@ -519,101 +522,79 @@ class DailyRace:
     margin: Optional[int]
     metric_type: str  # e.g. "time", "guesses", or "points"
     winner_uids: Tuple[str, ...] = ()  # all tied winners (empty = legacy)
+    runner_up_uids: Tuple[str, ...] = ()  # all players in the next rank group
     last_uids: Tuple[str, ...] = ()    # all tied last-place players
     last_value: Optional[int] = None   # worst metric_value in this game
     last_margin: Optional[int] = None  # gap between last and second-to-last
 
 
-def compute_daily_races(records: Iterable[Dict[str, Any]]) -> List[DailyRace]:
-    """Compute per-game winner and (if possible) runner up with margins."""
+def compute_daily_races(records: Iterable[Dict[str, Any]], day: Optional[str] = None) -> List[DailyRace]:
+    """Compute per-game rank groups before deriving race and last-place facts."""
+    records = deduplicate_score_records(records, day=day)
     by_game: Dict[str, List[Dict[str, Any]]] = {}
     for r in records:
-        g = str(r.get("game") or "").strip()
+        g = normalize_game(str(r.get("game") or "").strip())
         if not g:
             continue
         by_game.setdefault(g, []).append(r)
 
     races: List[DailyRace] = []
     for game, rows in by_game.items():
-        parsed: List[Tuple[int, str, str]] = []  # (metric_value, uid, metric_type)
+        parsed: List[Tuple[int, Dict[str, Any]]] = []
         for r in rows:
-            uid = str(r.get("user_id") or "").strip()
+            uid = canonical_user_id(str(r.get("user_id") or "").strip())
             if not uid:
                 continue
             mv = _safe_int(r.get("metric_value"))
             if mv is None or record_is_dnf(r):
                 continue
-            mt = str(r.get("metric_type") or "").strip() or "time"
-            parsed.append((mv, uid, mt))
+            parsed.append((mv, r))
 
         if not parsed:
             continue
 
-        parsed.sort(key=lambda t: metric_sort_value(t[0], t[2]))
-        best_val, best_uid, mt = parsed[0]
-        best_key = metric_sort_value(best_val, mt)
+        mt = str(parsed[0][1].get("metric_type") or "time").strip() or "time"
+        groups = rank_finishers(parsed, metric_type=mt)
+        first = groups[0]
+        first_value = first["value"]
+        winner_uids = tuple(sorted({
+            canonical_user_id(str(r.get("user_id") or "").strip())
+            for r in first["records"]
+        } - {""}))
+        second = groups[1] if len(groups) > 1 else None
+        runner_uids = tuple(sorted({
+            canonical_user_id(str(r.get("user_id") or "").strip())
+            for r in second["records"]
+        } - {""})) if second else ()
+        last = groups[-1]
+        last_uids = tuple(sorted({
+            canonical_user_id(str(r.get("user_id") or "").strip())
+            for r in last["records"]
+        } - {""}))
+        previous = groups[-2] if len(groups) > 1 else None
 
-        # collect ALL tied winners
-        all_winner_uids = tuple(uid for mv, uid, _ in parsed if mv == best_val)
+        margin = None
+        if second and first_value != second["value"]:
+            margin = first_value - second["value"] if higher_is_better(mt) else second["value"] - first_value
 
-        # Last place is the worst result in the game's own scoring direction.
-        worst_val = parsed[-1][0]
-        all_last_uids = tuple(uid for mv, uid, _ in parsed if mv == worst_val)
-        worst_key = metric_sort_value(worst_val, mt)
-        # Find the next distinct result ahead of last place.
-        second_last_val: Optional[int] = None
-        if worst_key > best_key:
-            for mv, uid, row_mt in reversed(parsed):
-                if metric_sort_value(mv, row_mt) < worst_key:
-                    second_last_val = mv
-                    break
-        if second_last_val is None:
-            l_margin = None
-        elif higher_is_better(mt):
-            l_margin = second_last_val - worst_val
-        else:
-            l_margin = worst_val - second_last_val
+        last_margin = None
+        if previous and previous["value"] != last["value"]:
+            last_margin = previous["value"] - last["value"] if higher_is_better(mt) else last["value"] - previous["value"]
 
-        # Runner-up is the next distinct result in the game's scoring direction.
-        runner: Optional[Tuple[int, str]] = None
-        for mv, uid, row_mt in parsed[1:]:
-            if metric_sort_value(mv, row_mt) > best_key:
-                runner = (mv, uid)
-                break
-
-        if runner:
-            runner_val, runner_uid = runner
-            races.append(
-                DailyRace(
-                    game=game,
-                    winner_uid=best_uid,
-                    runner_up_uid=runner_uid,
-                    best_value=best_val,
-                    runner_up_value=runner_val,
-                    margin=(best_val - runner_val) if higher_is_better(mt) else (runner_val - best_val),
-                    metric_type=mt,
-                    winner_uids=all_winner_uids,
-                    last_uids=all_last_uids,
-                    last_value=worst_val,
-                    last_margin=l_margin,
-                )
-            )
-        else:
-            races.append(
-                DailyRace(
-                    game=game,
-                    winner_uid=best_uid,
-                    runner_up_uid=None,
-                    best_value=best_val,
-                    runner_up_value=None,
-                    margin=None,
-                    metric_type=mt,
-                    winner_uids=all_winner_uids,
-                    last_uids=all_last_uids,
-                    last_value=worst_val,
-                    last_margin=l_margin,
-                )
-            )
+        races.append(DailyRace(
+            game=game,
+            winner_uid=winner_uids[0] if winner_uids else "",
+            runner_up_uid=runner_uids[0] if runner_uids else None,
+            best_value=first_value,
+            runner_up_value=second["value"] if second else None,
+            margin=margin,
+            metric_type=mt,
+            winner_uids=winner_uids,
+            runner_up_uids=runner_uids,
+            last_uids=last_uids,
+            last_value=last["value"],
+            last_margin=last_margin,
+        ))
 
     return races
 
@@ -640,8 +621,11 @@ def build_daily_facts(
     complete_players: int,
 ) -> Dict[str, Any]:
     """Extract a compact, deterministic fact bundle for recap generation."""
-    players = sorted({str(r.get("user_id") or "").strip() for r in records if str(r.get("user_id") or "").strip()})
-    races = compute_daily_races(records)
+    players = sorted({
+        uid for r in records
+        if (uid := canonical_user_id(str(r.get("user_id") or "").strip()))
+    })
+    races = compute_daily_races(records, day=day)
 
     tightest: Optional[DailyRace] = None
     blowout: Optional[DailyRace] = None
@@ -708,6 +692,7 @@ def build_daily_facts(
             "winner_uid": r.winner_uid,
             "winner_uids": w_uids,
             "runner_up_uid": r.runner_up_uid,
+            "runner_up_uids": list(r.runner_up_uids),
             "best_value": r.best_value,
             "runner_up_value": r.runner_up_value,
             "margin": r.margin,
@@ -774,15 +759,16 @@ def render_daily_recap_text(facts: Dict[str, Any]) -> str:
     if isinstance(tight, dict) and tight.get("game") and tight.get("margin") is not None:
         g = tight["game"]
         w_uids = tight.get("winner_uids") or [tight.get("winner_uid")]
-        runner = tight.get("runner_up_uid")
+        runner_uids = tight.get("runner_up_uids") or ([tight.get("runner_up_uid")] if tight.get("runner_up_uid") else [])
         margin = int(tight.get("margin") or 0)
         mt = str(tight.get("metric_type") or "time")
         best_display = tight.get("best_display")
         best_val = _format_value(mt, int(tight.get("best_value") or 0), best_display)
         unit = "s" if mt == "time" else f" {metric_unit(mt) or mt}"
-        if runner:
+        if runner_uids:
             winner_tags = ", ".join(f"<@{u}>" for u in w_uids)
-            lines.append(f"- Tightest: {g} won by {winner_tags} over <@{runner}> by {margin}{unit} (best {best_val})")
+            runner_tags = ", ".join(f"<@{u}>" for u in runner_uids)
+            lines.append(f"- Tightest: {g} won by {winner_tags} over {runner_tags} by {margin}{unit} (best {best_val})")
 
     blow = facts.get("blowout")
     if isinstance(blow, dict) and blow.get("game") and blow.get("margin") is not None:
@@ -833,7 +819,14 @@ def render_monthly_recap_text(facts: Dict[str, Any]) -> str:
     label = str(facts.get("month_label") or facts.get("month") or "").strip()
 
     def tags(uids: Any) -> str:
-        return ", ".join(f"<@{u}>" for u in (uids or []) if str(u).strip())
+        normalized: List[str] = []
+        seen: set[str] = set()
+        for value in uids if isinstance(uids, (list, tuple)) else []:
+            uid = canonical_user_id(str(value or "").strip())
+            if uid and uid not in seen:
+                seen.add(uid)
+                normalized.append(uid)
+        return ", ".join(f"<@{uid}>" for uid in normalized)
 
     lines: List[str] = []
     lines.append(f"*Month in review: {label}*")
@@ -894,11 +887,12 @@ def render_monthly_recap_text(facts: Dict[str, Any]) -> str:
         mt = str(tight.get("metric_type") or "time")
         unit = "s" if mt == "time" else f" {metric_unit(mt) or mt}"
         winners = tight.get("winner_uids") or ([tight.get("winner_uid")] if tight.get("winner_uid") else [])
-        runner = tight.get("runner_up_uid")
-        if winners and runner:
+        runner_uids = tight.get("runner_up_uids") or ([tight.get("runner_up_uid")] if tight.get("runner_up_uid") else [])
+        if winners and runner_uids:
+            runner_tags = tags(runner_uids)
             lines.append(
                 f"- Tightest race: {tight['game']} on {tight.get('day')}, "
-                f"{tags(winners)} over <@{runner}> by {int(tight['margin'])}{unit}"
+                f"{tags(winners)} over {runner_tags} by {int(tight['margin'])}{unit}"
             )
 
     blow = facts.get("blowout")

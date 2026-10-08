@@ -38,7 +38,11 @@ from openai_compat import (
     default_reasoning_effort,
     model_uses_reasoning,
 )
-from score_metrics import higher_is_better, metric_sort_value, record_is_dnf
+from score_metrics import metric_sort_value, record_is_dnf
+from parser import canonical_user_id
+from score_identity import deduplicate_score_records
+from scoring import rank_finishers
+from ledger_contracts import monthly_facts_from_summary
 
 __version__ = "3.4.1"
 
@@ -641,12 +645,6 @@ def _infer_window_from_text(q: str, today: date) -> Tuple[str, str, str]:
     if re.search(r"\bthis\s+year\b|\bcurrent\s+year\b", t):
         return ("this_year", "", "")
     return ("all_time", "", "")
-
-
-def _infer_preset_from_text(q: str) -> str:
-    """Backwards-compatible wrapper used by tests/legacy callers."""
-    preset, _start, _end = _infer_window_from_text(q, date.today())
-    return preset
 
 
 def _dr(preset: str, start: str, end: str, *, default_when_all_time: Optional[str] = None) -> Dict[str, str]:
@@ -1948,58 +1946,6 @@ def _fmt_mmss(seconds: float) -> str:
 # Deterministic executors
 # ---------------------------
 
-def _wins_leaderboard(payloads: Dict[str, Dict[str, Any]], *, game: str, dr: DateRange, limit: int) -> str:
-    wins: Dict[str, int] = {}
-    ties: Dict[str, int] = {}
-    days_considered = 0
-    days_with_game = 0
-
-    for day_key, p in payloads.items():
-        d = _parse_day_key(day_key)
-        if not d or d < dr.start or d > dr.end:
-            continue
-        days_considered += 1
-        wbg = p.get("winners_by_game") or {}
-        outcome = wbg.get(game)
-        if not isinstance(outcome, dict):
-            continue
-        days_with_game += 1
-        res = str(outcome.get("result") or "")
-        winners = outcome.get("winners") or []
-        if not isinstance(winners, list):
-            continue
-
-        if res == "tie":
-            for w in winners:
-                if isinstance(w, dict):
-                    uid = str(w.get("user_id") or "").strip()
-                    if uid:
-                        ties[uid] = ties.get(uid, 0) + 1
-        else:
-            # treat anything else as a trophy win (including legacy "win")
-            if winners and isinstance(winners[0], dict):
-                uid = str(winners[0].get("user_id") or "").strip()
-                if uid:
-                    wins[uid] = wins.get(uid, 0) + 1
-
-    users = sorted(set(list(wins.keys()) + list(ties.keys())))
-    if not users or days_with_game == 0:
-        return f"*{game} wins leaderboard*\nNo finalized results found in that date range."
-
-    ranked = sorted(users, key=lambda u: (-wins.get(u, 0), -ties.get(u, 0), u))
-    top = ranked[:limit]
-
-    lines: List[str] = []
-    lines.append(f"*{game} wins leaderboard*")
-    lines.append(
-        f"Range: {dr.start.isoformat()} to {dr.end.isoformat()} "
-        f"(finalized days scanned: {days_considered}, days with {game}: {days_with_game})"
-    )
-    for i, uid in enumerate(top, 1):
-        lines.append(f"{i}. <@{uid}>  :trophy:x{wins.get(uid, 0)}  :necktie:x{ties.get(uid, 0)}")
-    return "\n".join(lines)
-
-
 def _fmt_metric(metric_type: str, v: float, display: str = "") -> str:
     mt = (metric_type or "").strip().lower()
     if mt == "time":
@@ -2023,154 +1969,6 @@ def _fmt_metric(metric_type: str, v: float, display: str = "") -> str:
     return str(v)
 
 
-def _user_stat(
-    scores: List[Dict[str, str]],
-    *,
-    normalize_game: Callable[[str], str],
-    asker_uid: str,
-    game: str,
-    stat: str,
-    dr: DateRange,
-) -> str:
-    by_day: Dict[str, List[Dict[str, str]]] = {}
-    for r in scores:
-        day_key = str(r.get("day") or "").strip()
-        if not day_key:
-            continue
-        d = _parse_day_key(day_key)
-        if not d or d < dr.start or d > dr.end:
-            continue
-        by_day.setdefault(day_key, []).append(r)
-
-    vals: List[int] = []
-    samples: List[Tuple[str, int, str, str]] = []  # day, value, display, metric_type
-
-    for day_key, rows in by_day.items():
-        # Choose primary puzzle_id for that day+game by most unique players.
-        counts: Dict[int, set] = {}
-        for r in rows:
-            if normalize_game(str(r.get("game") or "").strip()) != game:
-                continue
-            if record_is_dnf(r):
-                continue
-            uid = str(r.get("user_id") or "").strip()
-            pid_s = str(r.get("puzzle_id") or "").strip()
-            if not uid or not pid_s:
-                continue
-            try:
-                pid = int(pid_s)
-            except Exception:
-                continue
-            counts.setdefault(pid, set()).add(uid)
-
-        if not counts:
-            continue
-        primary_pid = sorted(counts.items(), key=lambda kv: (-len(kv[1]), kv[0]))[0][0]
-
-        # Pull asker's value for that day+game+primary puzzle_id
-        for r in rows:
-            if normalize_game(str(r.get("game") or "").strip()) != game:
-                continue
-            uid = str(r.get("user_id") or "").strip()
-            if uid != asker_uid:
-                continue
-            pid_s = str(r.get("puzzle_id") or "").strip()
-            try:
-                pid = int(pid_s)
-            except Exception:
-                continue
-            if pid != primary_pid:
-                continue
-            if record_is_dnf(r):
-                continue
-            mv_s = str(r.get("metric_value") or "").strip()
-            try:
-                mv = int(mv_s)
-            except Exception:
-                continue
-            vals.append(mv)
-            disp = str(r.get("display") or "").strip()
-            mtype = str(r.get("metric_type") or "").strip()
-            samples.append((day_key, mv, disp, mtype))
-            break
-
-    if not vals:
-        return f"*{game} {stat}* for <@{asker_uid}>\nNo scores found in range {dr.start.isoformat()} to {dr.end.isoformat()}."
-
-    # Metric type is stable per game; pick the most common in samples.
-    types = [s[3] for s in samples if s[3]]
-    metric_type = types[0] if types else "time"
-
-    if stat == "count":
-        out_val = str(len(vals))
-    elif stat == "mean":
-        out_val = _fmt_metric(metric_type, float(statistics.mean(vals)))
-    elif stat == "median":
-        out_val = _fmt_metric(metric_type, float(statistics.median(vals)))
-    elif stat == "min":
-        out_val = _fmt_metric(metric_type, float(min(vals)))
-    elif stat == "max":
-        out_val = _fmt_metric(metric_type, float(max(vals)))
-    else:
-        out_val = _fmt_metric(metric_type, float(statistics.median(vals)))
-
-    higher = higher_is_better(metric_type)
-    best = sorted(samples, key=lambda x: x[1], reverse=higher)[:3]
-    worst = sorted(samples, key=lambda x: x[1], reverse=not higher)[:3]
-
-    lines: List[str] = []
-    lines.append(f"*{game} {stat}* for <@{asker_uid}>")
-    lines.append(f"Range: {dr.start.isoformat()} to {dr.end.isoformat()}")
-    lines.append(f"- N={len(vals)}  {stat}={out_val}")
-    if stat != "count":
-        lines.append("- Best:")
-        for d, v, disp, mt in best:
-            lines.append(f"  - {d}: {_fmt_metric(mt or metric_type, float(v), disp)} ({disp or _fmt_metric(mt or metric_type, float(v))})")
-        lines.append("- Worst:")
-        for d, v, disp, mt in worst:
-            lines.append(f"  - {d}: {_fmt_metric(mt or metric_type, float(v), disp)} ({disp or _fmt_metric(mt or metric_type, float(v))})")
-    return "\n".join(lines)
-
-
-
-
-def _best_week(payloads: Dict[str, Dict[str, Any]], *, asker_uid: str, dr: DateRange) -> str:
-    # Week starts Monday
-    wk: Dict[date, Tuple[int, int]] = {}
-
-    for day_key, p in payloads.items():
-        d = _parse_day_key(day_key)
-        if not d or d < dr.start or d > dr.end:
-            continue
-        awards = (p.get("awards_by_user") or {}).get(asker_uid)
-        if awards is None:
-            continue
-        if isinstance(awards, int):
-            trophies, ties = int(awards), 0
-        elif isinstance(awards, dict):
-            trophies = int(awards.get("wins", awards.get("trophies", 0)) or 0)
-            ties = int(awards.get("ties", 0) or 0)
-        else:
-            continue
-
-        ws = d - timedelta(days=d.weekday())
-        cur = wk.get(ws, (0, 0))
-        wk[ws] = (cur[0] + trophies, cur[1] + ties)
-
-    if not wk:
-        return f"*Best week* for <@{asker_uid}>\nNo finalized awards found in range {dr.start.isoformat()} to {dr.end.isoformat()}."
-
-    best_start, (bw, bt) = max(wk.items(), key=lambda kv: (kv[1][0], kv[1][1], kv[0].toordinal()))
-    best_end = best_start + timedelta(days=6)
-
-    lines: List[str] = []
-    lines.append(f"*Best week* for <@{asker_uid}>")
-    lines.append(f"Range: {dr.start.isoformat()} to {dr.end.isoformat()} (finalized days)")
-    lines.append(f"- Week: {best_start.isoformat()} to {best_end.isoformat()}")
-    lines.append(f"- Awards: :trophy:x{bw}  :necktie:x{bt}")
-    return "\n".join(lines)
-
-
 def _iter_primary_day_game_rows(
     scores: List[Dict[str, str]],
     *,
@@ -2182,6 +1980,7 @@ def _iter_primary_day_game_rows(
     Returns mapping (day_key, game_norm) -> rows belonging to that day/game's PRIMARY puzzle_id,
     where "primary" is defined as the puzzle_id with the most unique players that day.
     """
+    scores = deduplicate_score_records(scores)
     by_day: Dict[str, List[Dict[str, str]]] = {}
     for r in scores:
         day_key = str(r.get("day") or "").strip()
@@ -2200,7 +1999,7 @@ def _iter_primary_day_game_rows(
             g = normalize_game(str(r.get("game") or "").strip())
             if not g:
                 continue
-            uid = str(r.get("user_id") or "").strip()
+            uid = canonical_user_id(str(r.get("user_id") or "").strip())
             pid_s = str(r.get("puzzle_id") or "").strip()
             if not uid or not pid_s:
                 continue
@@ -2225,284 +2024,16 @@ def _iter_primary_day_game_rows(
     return out
 
 
-def _personal_bests_by_game(
-    scores: List[Dict[str, str]],
-    *,
-    normalize_game: Callable[[str], str],
-    uid: str,
-    games: List[str],
-    dr: DateRange,
-) -> str:
-    primary = _iter_primary_day_game_rows(scores, normalize_game=normalize_game, dr=dr)
-    best_by_game: Dict[str, Tuple[int, str, str, str]] = {}  # game -> (mv, day, display, metric_type)
-
-    for (day_key, g), rows in primary.items():
-        if g not in games:
-            continue
-        for r in rows:
-            if str(r.get("user_id") or "").strip() != uid:
-                continue
-            if record_is_dnf(r):
-                continue
-            mv_s = str(r.get("metric_value") or "").strip()
-            try:
-                mv = int(mv_s)
-            except Exception:
-                continue
-            disp = str(r.get("display") or "").strip()
-            mtype = str(r.get("metric_type") or "").strip()
-            cur = best_by_game.get(g)
-            if cur is None or metric_sort_value(mv, mtype) < metric_sort_value(cur[0], cur[3]):
-                best_by_game[g] = (mv, day_key, disp, mtype)
-            break
-
-    if not best_by_game:
-        return f"*Personal bests (by game)* for <@{uid}>\nNo scores found in range {dr.start.isoformat()} to {dr.end.isoformat()}."
-
-    lines: List[str] = []
-    lines.append(f"*Personal bests (by game)* for <@{uid}>")
-    lines.append(f"Range: {dr.start.isoformat()} to {dr.end.isoformat()} (primary puzzles only)")
-    for g in games:
-        if g not in best_by_game:
-            continue
-        mv, day_key, disp, mt = best_by_game[g]
-        v = _fmt_metric(mt, float(mv), disp)
-        lines.append(f"- {g}: {v} on {day_key} (<@{uid}>)")
-    return "\n".join(lines)
 
 
-def _global_bests_by_game(
-    scores: List[Dict[str, str]],
-    *,
-    normalize_game: Callable[[str], str],
-    games: List[str],
-    dr: DateRange,
-) -> str:
-    primary = _iter_primary_day_game_rows(scores, normalize_game=normalize_game, dr=dr)
-    best_by_game: Dict[str, Tuple[int, str, str, str, str]] = {}  # game -> (mv, day, uid, display, metric_type)
-
-    for (day_key, g), rows in primary.items():
-        if g not in games:
-            continue
-        for r in rows:
-            mv_s = str(r.get("metric_value") or "").strip()
-            uid = str(r.get("user_id") or "").strip()
-            if not uid:
-                continue
-            if record_is_dnf(r):
-                continue
-            try:
-                mv = int(mv_s)
-            except Exception:
-                continue
-            disp = str(r.get("display") or "").strip()
-            mt = str(r.get("metric_type") or "").strip()
-            cur = best_by_game.get(g)
-            if cur is None or metric_sort_value(mv, mt) < metric_sort_value(cur[0], cur[4]):
-                best_by_game[g] = (mv, day_key, uid, disp, mt)
-
-    if not best_by_game:
-        return f"*All-time best scores (by game)*\nNo scores found in range {dr.start.isoformat()} to {dr.end.isoformat()}."
-
-    lines: List[str] = []
-    lines.append("*All-time best scores (by game)*")
-    lines.append(f"Range: {dr.start.isoformat()} to {dr.end.isoformat()} (primary puzzles only)")
-    for g in games:
-        if g not in best_by_game:
-            continue
-        mv, day_key, uid, disp, mt = best_by_game[g]
-        v = _fmt_metric(mt, float(mv), disp)
-        lines.append(f"- {g}: {v} by <@{uid}> on {day_key} ({disp or v})")
-    return "\n".join(lines)
 
 
-def _game_record(
-    scores: List[Dict[str, str]],
-    *,
-    normalize_game: Callable[[str], str],
-    game: str,
-    dr: DateRange,
-    limit: int,
-) -> str:
-    primary = _iter_primary_day_game_rows(scores, normalize_game=normalize_game, dr=dr)
-    entries: List[Tuple[int, str, str, str, str]] = []  # mv, day, uid, display, metric_type
-
-    for (day_key, g), rows in primary.items():
-        if g != game:
-            continue
-        for r in rows:
-            uid = str(r.get("user_id") or "").strip()
-            mv_s = str(r.get("metric_value") or "").strip()
-            if not uid:
-                continue
-            if record_is_dnf(r):
-                continue
-            try:
-                mv = int(mv_s)
-            except Exception:
-                continue
-            disp = str(r.get("display") or "").strip()
-            mt = str(r.get("metric_type") or "").strip()
-            entries.append((mv, day_key, uid, disp, mt))
-
-    if not entries:
-        return f"*{game} record*\nNo scores found in range {dr.start.isoformat()} to {dr.end.isoformat()}."
-
-    entries.sort(key=lambda x: (metric_sort_value(x[0], x[4]), x[1], x[2]))
-    top = entries[: max(3, min(25, limit))]
-
-    best_mv, best_day, best_uid, best_disp, best_mt = top[0]
-    best_v = _fmt_metric(best_mt, float(best_mv), best_disp)
-
-    lines: List[str] = []
-    lines.append(f"*{game} record*")
-    lines.append(f"Range: {dr.start.isoformat()} to {dr.end.isoformat()} (primary puzzles only)")
-    lines.append(f"- Best: {best_v} by <@{best_uid}> on {best_day} ({best_disp or best_v})")
-    lines.append("- Top:")
-    for i, (mv, day_key, uid, disp, mt) in enumerate(top, 1):
-        v = _fmt_metric(mt, float(mv), disp)
-        lines.append(f"  {i}. {v} by <@{uid}> on {day_key}")
-    return "\n".join(lines)
 
 
-def _distribution_summary(
-    scores: List[Dict[str, str]],
-    *,
-    normalize_game: Callable[[str], str],
-    uid: str,
-    game: str,
-    dr: DateRange,
-) -> str:
-    primary = _iter_primary_day_game_rows(scores, normalize_game=normalize_game, dr=dr)
-    vals: List[int] = []
-    mt = "time"
-    for (day_key, g), rows in primary.items():
-        if g != game:
-            continue
-        for r in rows:
-            if str(r.get("user_id") or "").strip() != uid:
-                continue
-            mv_s = str(r.get("metric_value") or "").strip()
-            try:
-                mv = int(mv_s)
-            except Exception:
-                continue
-            vals.append(mv)
-            mt = str(r.get("metric_type") or mt).strip() or mt
-            break
-
-    if not vals:
-        return f"*{game} distribution* for <@{uid}>\nNo scores found in range {dr.start.isoformat()} to {dr.end.isoformat()}."
-
-    vals_sorted = sorted(vals)
-    n = len(vals_sorted)
-
-    def q(p: float) -> float:
-        if n == 1:
-            return float(vals_sorted[0])
-        idx = (n - 1) * p
-        lo = int(idx)
-        hi = min(n - 1, lo + 1)
-        frac = idx - lo
-        return vals_sorted[lo] * (1 - frac) + vals_sorted[hi] * frac
-
-    p10, p25, p50, p75, p90 = q(0.10), q(0.25), q(0.50), q(0.75), q(0.90)
-    vmin, vmax = float(vals_sorted[0]), float(vals_sorted[-1])
-
-    lines: List[str] = []
-    lines.append(f"*{game} distribution* for <@{uid}>")
-    lines.append(f"Range: {dr.start.isoformat()} to {dr.end.isoformat()} (primary puzzles only)")
-    lines.append(f"- N={n}")
-    lines.append(f"- min={_fmt_metric(mt, vmin)}  p10={_fmt_metric(mt, p10)}  p25={_fmt_metric(mt, p25)}  median={_fmt_metric(mt, p50)}  p75={_fmt_metric(mt, p75)}  p90={_fmt_metric(mt, p90)}  max={_fmt_metric(mt, vmax)}")
-    if mt.lower() == "guesses":
-        # Simple bar by guess count (usually 1..5)
-        counts: Dict[int, int] = {}
-        for v in vals_sorted:
-            counts[int(v)] = counts.get(int(v), 0) + 1
-        lines.append("- Histogram:")
-        for k in sorted(counts.keys()):
-            lines.append(f"  - {k}: " + ("█" * counts[k]) + f" ({counts[k]})")
-    return "\n".join(lines)
 
 
-def _all_games_awards_leaderboard(payloads: Dict[str, Dict[str, Any]], *, dr: DateRange, limit: int) -> str:
-    wins: Dict[str, int] = {}
-    ties: Dict[str, int] = {}
-    days_scanned = 0
-    days_with_awards = 0
-
-    for day_key, p in payloads.items():
-        d = _parse_day_key(day_key)
-        if not d or d < dr.start or d > dr.end:
-            continue
-        days_scanned += 1
-        awards = p.get("awards_by_user") or {}
-        if not isinstance(awards, dict) or not awards:
-            continue
-        days_with_awards += 1
-        for uid, v in awards.items():
-            if isinstance(v, int):
-                wins[uid] = wins.get(uid, 0) + int(v)
-            elif isinstance(v, dict):
-                wins[uid] = wins.get(uid, 0) + int(v.get("wins", v.get("trophies", 0)) or 0)
-                ties[uid] = ties.get(uid, 0) + int(v.get("ties", 0) or 0)
-
-    users = sorted(set(list(wins.keys()) + list(ties.keys())))
-    if not users:
-        return "*All-games awards leaderboard*\nNo finalized awards found in that date range."
-
-    ranked = sorted(users, key=lambda u: (-wins.get(u, 0), -ties.get(u, 0), u))
-    top = ranked[:limit]
-
-    lines: List[str] = []
-    lines.append("*All-games awards leaderboard*")
-    lines.append(
-        f"Range: {dr.start.isoformat()} to {dr.end.isoformat()} "
-        f"(finalized days scanned: {days_scanned}, days with awards: {days_with_awards})"
-    )
-    for i, uid in enumerate(top, 1):
-        lines.append(f"{i}. <@{uid}>  :trophy:x{wins.get(uid, 0)}  :necktie:x{ties.get(uid, 0)}")
-    return "\n".join(lines)
 
 
-def _user_game_awards(payloads: Dict[str, Dict[str, Any]], *, game: str, uid: str, dr: DateRange) -> str:
-    wins = 0
-    ties = 0
-    days_scanned = 0
-    days_with_game = 0
-
-    for day_key, p in payloads.items():
-        d = _parse_day_key(day_key)
-        if not d or d < dr.start or d > dr.end:
-            continue
-        days_scanned += 1
-        wbg = p.get("winners_by_game") or {}
-        outcome = wbg.get(game)
-        if not isinstance(outcome, dict):
-            continue
-        days_with_game += 1
-        res = str(outcome.get("result") or "")
-        winners = outcome.get("winners") or []
-        if not isinstance(winners, list):
-            continue
-
-        if res == "tie":
-            for w in winners:
-                if isinstance(w, dict) and str(w.get("user_id") or "").strip() == uid:
-                    ties += 1
-                    break
-        else:
-            if winners and isinstance(winners[0], dict) and str(winners[0].get("user_id") or "").strip() == uid:
-                wins += 1
-
-    lines: List[str] = []
-    lines.append(f"*{game} awards* for <@{uid}>")
-    lines.append(
-        f"Range: {dr.start.isoformat()} to {dr.end.isoformat()} "
-        f"(finalized days scanned: {days_scanned}, days with {game}: {days_with_game})"
-    )
-    lines.append(f"- :trophy:x{wins}  :necktie:x{ties}")
-    return "\n".join(lines)
 
 
 # ---------------------------
@@ -2529,7 +2060,7 @@ def _compute_placements(
             continue
 
         # Parse metric values for each participant
-        parsed: List[Tuple[int, str, str]] = []  # (metric_value, uid, metric_type)
+        parsed: List[Tuple[int, Dict[str, str]]] = []
         for r in rows:
             uid = str(r.get("user_id") or "").strip()
             mv_s = str(r.get("metric_value") or "").strip()
@@ -2541,31 +2072,19 @@ def _compute_placements(
                 mv = int(mv_s)
             except Exception:
                 continue
-            metric_type = str(r.get("metric_type") or "").strip()
-            parsed.append((mv, uid, metric_type))
+            parsed.append((mv, r))
 
         if len(parsed) < 2:
             continue  # need at least 2 players for meaningful placement
 
         # Time and guesses are lower-is-better; native point scores are higher-is-better.
-        metric_type = parsed[0][2]
-        parsed.sort(key=lambda t: metric_sort_value(t[0], t[2] or metric_type))
-
-        # Assign ranks (1224 competition ranking)
-        ranks: Dict[str, int] = {}
-        rank = 1
-        i = 0
-        while i < len(parsed):
-            j = i
-            while j < len(parsed) and parsed[j][0] == parsed[i][0]:
-                j += 1
-            for k in range(i, j):
-                ranks[parsed[k][1]] = rank
-            rank = j + 1
-            i = j
-
-        for uid, r in ranks.items():
-            placements.setdefault(uid, {}).setdefault(game, []).append(r)
+        metric_type = str(parsed[0][1].get("metric_type") or "time").strip() or "time"
+        groups = rank_finishers(parsed, metric_type=metric_type)
+        for group in groups:
+            for record in group["records"]:
+                uid = canonical_user_id(str(record.get("user_id") or "").strip())
+                if uid:
+                    placements.setdefault(uid, {}).setdefault(game, []).append(group["place"])
 
     return placements
 
@@ -2722,108 +2241,6 @@ def _consistency_compare(
     return "\n".join(lines)
 
 
-def _all_time_stats(
-    scores: List[Dict[str, str]],
-    payloads: Dict[str, Dict[str, Any]],
-    *,
-    normalize_game: Callable[[str], str],
-    uid: str,
-    games: List[str],
-    dr: DateRange,
-) -> str:
-    """Comprehensive all-time stats dashboard for a single player."""
-    # --- Trophies + ties from DailyResults ---
-    total_wins = 0
-    total_ties = 0
-    days_played = 0
-
-    for day_key, p in payloads.items():
-        d = _parse_day_key(day_key)
-        if not d or d < dr.start or d > dr.end:
-            continue
-        awards = (p.get("awards_by_user") or {}).get(uid)
-        if awards is None:
-            continue
-        days_played += 1
-        if isinstance(awards, int):
-            total_wins += int(awards)
-        elif isinstance(awards, dict):
-            total_wins += int(awards.get("wins", awards.get("trophies", 0)) or 0)
-            total_ties += int(awards.get("ties", 0) or 0)
-
-    # --- Per-game score stats ---
-    primary = _iter_primary_day_game_rows(scores, normalize_game=normalize_game, dr=dr)
-    game_vals: Dict[str, List[int]] = {}
-    game_mt: Dict[str, str] = {}
-
-    for (day_key, g), rows in primary.items():
-        if g not in games:
-            continue
-        for r in rows:
-            if str(r.get("user_id") or "").strip() != uid:
-                continue
-            mv_s = str(r.get("metric_value") or "").strip()
-            try:
-                mv = int(mv_s)
-            except Exception:
-                continue
-            game_vals.setdefault(g, []).append(mv)
-            mt = str(r.get("metric_type") or "time").strip()
-            game_mt[g] = mt
-            break
-
-    # --- Placement stats ---
-    all_placements = _compute_placements(scores, normalize_game=normalize_game, games=games, dr=dr)
-    user_ranks = all_placements.get(uid, {})
-    all_ranks: List[int] = []
-    for g in games:
-        all_ranks.extend(user_ranks.get(g, []))
-
-    # --- Build output ---
-    lines: List[str] = []
-    lines.append(f"*All-time stats* for <@{uid}>")
-    lines.append(f"Range: {dr.start.isoformat()} to {dr.end.isoformat()}")
-    lines.append(f"- Days played: {days_played} | :trophy:x{total_wins} | :necktie:x{total_ties}")
-
-    lines.append("- Per game:")
-    for g in games:
-        vals = game_vals.get(g)
-        if not vals:
-            continue
-        mt = game_mt.get(g, "time")
-        n = len(vals)
-        mean_v = statistics.mean(vals)
-        median_v = statistics.median(vals)
-        stdev_v = statistics.pstdev(vals) if n > 1 else 0.0
-        pb = min(vals, key=lambda value: metric_sort_value(value, mt))
-        if mt == "time":
-            stdev_str = f"{stdev_v:.0f}s"
-        else:
-            stdev_str = f"{stdev_v:.1f}"
-        lines.append(
-            f"  - {g}: N={n}, mean={_fmt_metric(mt, mean_v)}, "
-            f"median={_fmt_metric(mt, median_v)}, stdev={stdev_str}, "
-            f"PB={_fmt_metric(mt, float(pb))}"
-        )
-
-    if all_ranks:
-        n = len(all_ranks)
-        counts: Dict[int, int] = {}
-        for r in all_ranks:
-            counts[r] = counts.get(r, 0) + 1
-        rank_parts = []
-        for rv in sorted(counts.keys()):
-            pct = counts[rv] * 100.0 / n
-            rank_parts.append(f"{_ordinal(rv)}={pct:.0f}%")
-        lines.append(f"- Placement: {', '.join(rank_parts)}")
-
-        top_half_count = sum(1 for r in all_ranks if r <= 2)
-        stdev = statistics.pstdev(all_ranks) if n > 1 else 0.0
-        lines.append(f"- Top-half rate: {top_half_count*100.0/n:.0f}% | Placement stdev: {stdev:.2f}")
-
-    return "\n".join(lines)
-
-
 def _build_stats_facts(
     scores: List[Dict[str, str]],
     payloads: Dict[str, Dict[str, Any]],
@@ -2842,7 +2259,7 @@ def _build_stats_facts(
             continue
         parsed: List[Tuple[int, str, Dict[str, str]]] = []
         for r in rows:
-            uid = str(r.get("user_id") or "").strip()
+            uid = canonical_user_id(str(r.get("user_id") or "").strip())
             mv_s = str(r.get("metric_value") or "").strip()
             if not uid:
                 continue
@@ -2856,21 +2273,16 @@ def _build_stats_facts(
                 mv = 0
             parsed.append((mv, uid, r))
         result_rows = [item for item in parsed if not record_is_dnf(item[2])]
-        ranks: Dict[Tuple[str, int], int] = {}
+        ranks_by_record_id: Dict[int, int] = {}
         if result_rows:
             metric_type = str(result_rows[0][2].get("metric_type") or "time").strip()
-            result_rows.sort(key=lambda t: (metric_sort_value(t[0], str(t[2].get("metric_type") or metric_type)), t[1]))
-        rank = 1
-        i = 0
-        while i < len(result_rows):
-            j = i
-            while j < len(result_rows) and result_rows[j][0] == result_rows[i][0]:
-                j += 1
-            for k in range(i, j):
-                mv, uid, _r = result_rows[k]
-                ranks[(uid, mv)] = rank
-            rank = j + 1
-            i = j
+            ranked = rank_finishers(
+                [(mv, r) for mv, _uid, r in result_rows],
+                metric_type=metric_type or "time",
+            )
+            for group in ranked:
+                for record in group["records"]:
+                    ranks_by_record_id[id(record)] = group["place"]
         for mv, uid, r in parsed:
             score_facts.append(
                 ScoreFact(
@@ -2880,7 +2292,7 @@ def _build_stats_facts(
                     metric_type=str(r.get("metric_type") or "").strip() or "time",
                     metric_value=mv,
                     display=str(r.get("display") or "").strip(),
-                    rank=ranks.get((uid, mv), 0),
+                    rank=ranks_by_record_id.get(id(r), 0),
                     players=len(result_rows),
                     status=str(r.get("status") or "").strip(),
                 )
@@ -2897,7 +2309,7 @@ def _build_stats_facts(
         if not d or d < dr.start or d > dr.end:
             continue
         for uid, v in (payload.get("awards_by_user") or {}).items():
-            uid = str(uid or "").strip()
+            uid = canonical_user_id(str(uid or "").strip())
             if not uid:
                 continue
             awards_by_day_user[(day_key, uid)] = unpack_awards(v)
@@ -2917,7 +2329,7 @@ def _build_stats_facts(
                             continue
                         medal = medal_tally(int(entry.get("place") or 0))
                         for uid in entry.get("user_ids") or []:
-                            uid = str(uid or "").strip()
+                            uid = canonical_user_id(str(uid or "").strip())
                             if uid and medal.has_medals:
                                 game_awards.append(GameAwardFact(day_key, game_norm, uid, medal))
                     continue
@@ -2929,12 +2341,12 @@ def _build_stats_facts(
                 if result == "tie":
                     for w in winners:
                         if isinstance(w, dict):
-                            uid = str(w.get("user_id") or "").strip()
+                            uid = canonical_user_id(str(w.get("user_id") or "").strip())
                             if uid:
                                 game_awards.append(GameAwardFact(day_key, game_norm, uid, AwardTally(ties=1)))
                 else:
                     if winners and isinstance(winners[0], dict):
-                        uid = str(winners[0].get("user_id") or "").strip()
+                        uid = canonical_user_id(str(winners[0].get("user_id") or "").strip())
                         if uid:
                             game_awards.append(GameAwardFact(day_key, game_norm, uid, AwardTally(wins=1)))
 
@@ -3242,7 +2654,7 @@ def _format_clean_sweeps(facts: StatsFacts, *, dr: DateRange) -> str:
             if len(winners) != 1 or not isinstance(winners[0], dict):
                 sweep_uid = ""
                 break
-            uid = str(winners[0].get("user_id") or "").strip()
+            uid = canonical_user_id(str(winners[0].get("user_id") or "").strip())
             if not uid or (sweep_uid and uid != sweep_uid):
                 sweep_uid = ""
                 break
@@ -3276,7 +2688,7 @@ def _format_daily_report(facts: StatsFacts, *, dr: DateRange, games: List[str]) 
                 if not isinstance(outcome, dict):
                     continue
                 winners = outcome.get("winners") or []
-                uids = [str(w.get("user_id") or "").strip() for w in winners if isinstance(w, dict)]
+                uids = [canonical_user_id(str(w.get("user_id") or "").strip()) for w in winners if isinstance(w, dict)]
                 uids = [uid for uid in uids if uid]
                 if not uids:
                     continue
@@ -3303,13 +2715,20 @@ def _format_daily_report(facts: StatsFacts, *, dr: DateRange, games: List[str]) 
                 continue
             metric_type = entries[0].metric_type
             best_value = min(entries, key=lambda f: metric_sort_value(f.metric_value, f.metric_type)).metric_value
-            leaders = sorted({f.user_id for f in entries if f.metric_value == best_value})
+            valid_ranks = [f.rank for f in entries if isinstance(f.rank, int) and f.rank > 0]
+            if valid_ranks:
+                best_rank = min(valid_ranks)
+                leaders = sorted({f.user_id for f in entries if f.rank == best_rank})
+            else:
+                # Compatibility for manually constructed facts without ranks.
+                leaders = sorted({f.user_id for f in entries if f.metric_value == best_value})
             names = ", ".join(f"<@{uid}>" for uid in leaders)
             lines.append(f"- {game}: {names} ({_fmt_metric(metric_type, float(best_value))})")
     return "\n".join(lines)
 
 
 def _format_monthly_titles(store, *, uid: str, dr: DateRange) -> str:
+    uid = canonical_user_id(str(uid or "").strip())
     monthly_ws = getattr(store, "monthly", None)
     if monthly_ws is None:
         return f"*Monthly championships* for <@{uid}>\nMonthly results are unavailable."
@@ -3323,7 +2742,7 @@ def _format_monthly_titles(store, *, uid: str, dr: DateRange) -> str:
     if "month" not in header or "summary_json" not in header:
         return f"*Monthly championships* for <@{uid}>\nMonthly results are unavailable."
     month_i, summary_i = header.index("month"), header.index("summary_json")
-    titles: List[str] = []
+    latest_month_payloads: Dict[str, str] = {}
     for row in rows[1:]:
         month_key = (row[month_i] if month_i < len(row) else "").strip()
         if not re.fullmatch(r"\d{4}-\d{2}", month_key):
@@ -3332,19 +2751,48 @@ def _format_monthly_titles(store, *, uid: str, dr: DateRange) -> str:
         if not month_start or month_start < dr.start or month_start > dr.end:
             continue
         raw = (row[summary_i] if summary_i < len(row) else "").strip()
+        if raw:
+            # MonthlyResults is append-only; its last nonempty row is authoritative.
+            latest_month_payloads[month_key] = raw
+
+    titles: set[str] = set()
+    for month_key, raw in latest_month_payloads.items():
         try:
-            summary = json.loads(raw) if raw else {}
+            summary = json.loads(raw)
         except Exception:
             continue
-        champion = summary.get("champion") if isinstance(summary, dict) else None
-        winners = champion.get("user_ids") if isinstance(champion, dict) else None
-        if not isinstance(winners, list) and isinstance(summary, dict):
-            winners = [str(s.get("user_id") or "") for s in summary.get("standings") or [] if isinstance(s, dict) and int(s.get("place") or 0) == 1]
-        if uid in (winners or []):
-            titles.append(month_key)
+        facts = monthly_facts_from_summary(summary)
+        champion = facts.get("champion")
+        raw_winners = champion.get("user_ids") if isinstance(champion, dict) else None
+        winners = [
+            canonical_user_id(winner.strip())
+            for winner in raw_winners
+            if isinstance(winner, str) and winner.strip()
+        ] if isinstance(raw_winners, (list, tuple)) else []
+        winners = [winner for winner in winners if winner]
+        if not winners:
+            standings = facts.get("standings")
+            if isinstance(standings, list):
+                for standing in standings:
+                    if not isinstance(standing, dict):
+                        continue
+                    place = standing.get("place")
+                    if isinstance(place, bool):
+                        continue
+                    try:
+                        place_num = int(str(place).strip())
+                    except (TypeError, ValueError):
+                        continue
+                    user_id = standing.get("user_id")
+                    if place_num == 1 and isinstance(user_id, str) and user_id.strip():
+                        canonical_id = canonical_user_id(user_id.strip())
+                        if canonical_id:
+                            winners.append(canonical_id)
+        if uid in winners:
+            titles.add(month_key)
     lines = [f"*Monthly championships* for <@{uid}>", f"Range: {dr.start.isoformat()} to {dr.end.isoformat()}", f"- Recorded titles: {len(titles)}"]
     if titles:
-        lines.append(f"- Months: {', '.join(sorted(set(titles)))}")
+        lines.append(f"- Months: {', '.join(sorted(titles))}")
     return "\n".join(lines)
 
 

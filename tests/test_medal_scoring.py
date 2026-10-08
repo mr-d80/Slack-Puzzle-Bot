@@ -451,6 +451,7 @@ class _FinalizeStore:
 
     def mark_day_posted(self, day, summary):
         self.posted[day] = summary
+        return True
 
     def replace_day_summary(self, day, summary):
         self.posted[day] = summary

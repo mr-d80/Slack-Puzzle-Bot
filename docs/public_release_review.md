@@ -44,9 +44,11 @@ reporting behavior remains covered by the original suite.
 - Requirements audit, including resolved transitive dependencies:
   **no known vulnerabilities found** after patching. This is a point-in-time
   check, not proof that dependencies are vulnerability-free.
-- Independent code review found no remaining correctness/security blockers.
-- All Python source files parse under Python 3.10 grammar. The GitHub Actions
-  Linux/Windows matrix for Python 3.10, 3.12, and 3.14 awaits its first run.
+- Initial review of public setup and privacy safeguards passed. A subsequent
+  architecture review identified cross-module issues addressed below.
+- All Python source files parse under Python 3.10 grammar. The initial GitHub
+  Actions Linux/Windows matrix for Python 3.10, 3.12, and 3.14 passed, as did
+  the dependency audit.
 - Scanned **126 historical Git blobs** for common Slack/API token, Google
   credential, and private-key patterns, with **no matches**. Credential values
   were not printed, and local `.env`/service-account contents were not read.
@@ -82,6 +84,33 @@ Current fixtures use fake IDs/names.
   not been exercised in this review. Follow the README in a separate test
   workspace/sheet before promoting a public release.
 
-Before publication, confirm the new CI matrix passes and enable GitHub private
-vulnerability reporting. No production credentials need to accompany a source
-download.
+The public repository has a fresh history and private vulnerability reporting
+enabled. No production credentials accompany its source download.
+
+## Follow-up architecture review
+
+Private repository finalization was merged through
+[Slack-Puzzle-Tracker PR #12](https://github.com/mr-d80/Slack-Puzzle-Tracker/pull/12).
+Subsequent development takes place exclusively in Slack-Puzzle-Bot.
+
+The follow-up review found duplicated score-day/ranking rules, conflicting
+recovery flags, an incompatible monthly-title reader, unsafe JSON truncation,
+and a daily finalization claim that callers ignored. Public fixes introduce
+shared score identities and rankings, bounded recovery snapshots, explicit
+replay/finalization/delivery controls, a monthly payload contract, valid-JSON
+size checks, and claim-aware finalization and recap commands. See
+[Architecture and data contracts](architecture.md) for the maintained rules.
+
+Offline regression tests reproduce the original failures and check behavior
+across module boundaries. Previously inflated DailyResults are not silently
+rewritten: an administrator can deliberately force recalculation after
+checking the source Scores. Malformed existing summaries are preserved rather
+than overwritten. Live game/provider integrations remain untested.
+
+The score-identity/CLI phase passed **380 tests and 21 subtests**. The integrated
+ranking, ledger-contract, and finalization phase passed **413 tests and 29
+subtests**, with independent review after the compatibility fixes.
+After removing the eleven unused query helpers, the final integrated suite
+also passed **413 tests and 29 subtests**. Python 3.10 grammar and source
+credential-pattern checks passed; the smoke harness credential-path check
+used fake services from outside the checkout.
