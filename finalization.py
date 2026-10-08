@@ -26,12 +26,13 @@ from slack_safe import message_ts
 
 
 logger = logging.getLogger(__name__)
+_finalize_lock = threading.RLock()
 
 
 # ---------------------------------------------------------------------------
 # Finalization
 # ---------------------------------------------------------------------------
-def finalize_day(
+def _finalize_day_body(
     day: str,
     channel: str,
     store: Any,
@@ -39,6 +40,8 @@ def finalize_day(
     post: bool = True,
     force: bool = False,
     now_utc: Optional[datetime] = None,
+    post_scores: bool = True,
+    post_recap: Optional[bool] = None,
 ) -> str:
     """
     Finalization is the only place that can affect DailyResults and Totals.
@@ -126,17 +129,22 @@ def finalize_day(
     }
 
     if force and store.day_already_posted(day):
-        store.replace_day_summary(day, summary_payload)
+        claimed = store.replace_day_summary(day, summary_payload)
     else:
-        store.mark_day_posted(day, summary_payload)
+        claimed = store.mark_day_posted(day, summary_payload)
+    if not claimed:
+        return 'already_posted'
 
     store.rebuild_totals_from_daily()
 
     if post:
-        day_msg_ts = message_ts(client.chat_postMessage(channel=channel, text=scores_text))
+        day_msg_ts = ""
+        if post_scores:
+            day_msg_ts = message_ts(client.chat_postMessage(channel=channel, text=scores_text))
 
         recap_ts = ''
-        if POST_DAILY_RECAP and recap_text.strip():
+        should_post_recap = POST_DAILY_RECAP if post_recap is None else bool(post_recap)
+        if should_post_recap and recap_text.strip():
             if DAILY_RECAP_IN_THREAD and day_msg_ts:
                 recap_ts = message_ts(client.chat_postMessage(
                     channel=channel, text=recap_text, thread_ts=day_msg_ts,
@@ -153,12 +161,36 @@ def finalize_day(
     return 'posted'
 
 
+def finalize_day(
+    day: str,
+    channel: str,
+    store: Any,
+    client: Any,
+    post: bool = True,
+    force: bool = False,
+    now_utc: Optional[datetime] = None,
+    *,
+    post_scores: bool = True,
+    post_recap: Optional[bool] = None,
+) -> str:
+    """Serialize day finalization within this process and delegate the work."""
+    with _finalize_lock:
+        return _finalize_day_body(
+            day,
+            channel,
+            store,
+            client,
+            post=post,
+            force=force,
+            now_utc=now_utc,
+            post_scores=post_scores,
+            post_recap=post_recap,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Batch finalization
 # ---------------------------------------------------------------------------
-_finalize_lock = threading.Lock()
-
-
 def finalize_due_days(channel: str, store: Any, client: Any, post: bool = True) -> None:
     """Finalize any unposted days that are ready (enough complete players) or closed."""
     if not _finalize_lock.acquire(blocking=False):

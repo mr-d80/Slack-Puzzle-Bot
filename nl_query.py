@@ -39,6 +39,10 @@ from openai_compat import (
     model_uses_reasoning,
 )
 from score_metrics import higher_is_better, metric_sort_value, record_is_dnf
+from parser import canonical_user_id
+from score_identity import deduplicate_score_records
+from scoring import rank_finishers
+from ledger_contracts import monthly_facts_from_summary
 
 __version__ = "3.4.1"
 
@@ -2182,6 +2186,7 @@ def _iter_primary_day_game_rows(
     Returns mapping (day_key, game_norm) -> rows belonging to that day/game's PRIMARY puzzle_id,
     where "primary" is defined as the puzzle_id with the most unique players that day.
     """
+    scores = deduplicate_score_records(scores)
     by_day: Dict[str, List[Dict[str, str]]] = {}
     for r in scores:
         day_key = str(r.get("day") or "").strip()
@@ -2200,7 +2205,7 @@ def _iter_primary_day_game_rows(
             g = normalize_game(str(r.get("game") or "").strip())
             if not g:
                 continue
-            uid = str(r.get("user_id") or "").strip()
+            uid = canonical_user_id(str(r.get("user_id") or "").strip())
             pid_s = str(r.get("puzzle_id") or "").strip()
             if not uid or not pid_s:
                 continue
@@ -2529,7 +2534,7 @@ def _compute_placements(
             continue
 
         # Parse metric values for each participant
-        parsed: List[Tuple[int, str, str]] = []  # (metric_value, uid, metric_type)
+        parsed: List[Tuple[int, Dict[str, str]]] = []
         for r in rows:
             uid = str(r.get("user_id") or "").strip()
             mv_s = str(r.get("metric_value") or "").strip()
@@ -2541,31 +2546,19 @@ def _compute_placements(
                 mv = int(mv_s)
             except Exception:
                 continue
-            metric_type = str(r.get("metric_type") or "").strip()
-            parsed.append((mv, uid, metric_type))
+            parsed.append((mv, r))
 
         if len(parsed) < 2:
             continue  # need at least 2 players for meaningful placement
 
         # Time and guesses are lower-is-better; native point scores are higher-is-better.
-        metric_type = parsed[0][2]
-        parsed.sort(key=lambda t: metric_sort_value(t[0], t[2] or metric_type))
-
-        # Assign ranks (1224 competition ranking)
-        ranks: Dict[str, int] = {}
-        rank = 1
-        i = 0
-        while i < len(parsed):
-            j = i
-            while j < len(parsed) and parsed[j][0] == parsed[i][0]:
-                j += 1
-            for k in range(i, j):
-                ranks[parsed[k][1]] = rank
-            rank = j + 1
-            i = j
-
-        for uid, r in ranks.items():
-            placements.setdefault(uid, {}).setdefault(game, []).append(r)
+        metric_type = str(parsed[0][1].get("metric_type") or "time").strip() or "time"
+        groups = rank_finishers(parsed, metric_type=metric_type)
+        for group in groups:
+            for record in group["records"]:
+                uid = canonical_user_id(str(record.get("user_id") or "").strip())
+                if uid:
+                    placements.setdefault(uid, {}).setdefault(game, []).append(group["place"])
 
     return placements
 
@@ -2842,7 +2835,7 @@ def _build_stats_facts(
             continue
         parsed: List[Tuple[int, str, Dict[str, str]]] = []
         for r in rows:
-            uid = str(r.get("user_id") or "").strip()
+            uid = canonical_user_id(str(r.get("user_id") or "").strip())
             mv_s = str(r.get("metric_value") or "").strip()
             if not uid:
                 continue
@@ -2856,21 +2849,16 @@ def _build_stats_facts(
                 mv = 0
             parsed.append((mv, uid, r))
         result_rows = [item for item in parsed if not record_is_dnf(item[2])]
-        ranks: Dict[Tuple[str, int], int] = {}
+        ranks_by_record_id: Dict[int, int] = {}
         if result_rows:
             metric_type = str(result_rows[0][2].get("metric_type") or "time").strip()
-            result_rows.sort(key=lambda t: (metric_sort_value(t[0], str(t[2].get("metric_type") or metric_type)), t[1]))
-        rank = 1
-        i = 0
-        while i < len(result_rows):
-            j = i
-            while j < len(result_rows) and result_rows[j][0] == result_rows[i][0]:
-                j += 1
-            for k in range(i, j):
-                mv, uid, _r = result_rows[k]
-                ranks[(uid, mv)] = rank
-            rank = j + 1
-            i = j
+            ranked = rank_finishers(
+                [(mv, r) for mv, _uid, r in result_rows],
+                metric_type=metric_type or "time",
+            )
+            for group in ranked:
+                for record in group["records"]:
+                    ranks_by_record_id[id(record)] = group["place"]
         for mv, uid, r in parsed:
             score_facts.append(
                 ScoreFact(
@@ -2880,7 +2868,7 @@ def _build_stats_facts(
                     metric_type=str(r.get("metric_type") or "").strip() or "time",
                     metric_value=mv,
                     display=str(r.get("display") or "").strip(),
-                    rank=ranks.get((uid, mv), 0),
+                    rank=ranks_by_record_id.get(id(r), 0),
                     players=len(result_rows),
                     status=str(r.get("status") or "").strip(),
                 )
@@ -2897,7 +2885,7 @@ def _build_stats_facts(
         if not d or d < dr.start or d > dr.end:
             continue
         for uid, v in (payload.get("awards_by_user") or {}).items():
-            uid = str(uid or "").strip()
+            uid = canonical_user_id(str(uid or "").strip())
             if not uid:
                 continue
             awards_by_day_user[(day_key, uid)] = unpack_awards(v)
@@ -2917,7 +2905,7 @@ def _build_stats_facts(
                             continue
                         medal = medal_tally(int(entry.get("place") or 0))
                         for uid in entry.get("user_ids") or []:
-                            uid = str(uid or "").strip()
+                            uid = canonical_user_id(str(uid or "").strip())
                             if uid and medal.has_medals:
                                 game_awards.append(GameAwardFact(day_key, game_norm, uid, medal))
                     continue
@@ -2929,12 +2917,12 @@ def _build_stats_facts(
                 if result == "tie":
                     for w in winners:
                         if isinstance(w, dict):
-                            uid = str(w.get("user_id") or "").strip()
+                            uid = canonical_user_id(str(w.get("user_id") or "").strip())
                             if uid:
                                 game_awards.append(GameAwardFact(day_key, game_norm, uid, AwardTally(ties=1)))
                 else:
                     if winners and isinstance(winners[0], dict):
-                        uid = str(winners[0].get("user_id") or "").strip()
+                        uid = canonical_user_id(str(winners[0].get("user_id") or "").strip())
                         if uid:
                             game_awards.append(GameAwardFact(day_key, game_norm, uid, AwardTally(wins=1)))
 
@@ -3242,7 +3230,7 @@ def _format_clean_sweeps(facts: StatsFacts, *, dr: DateRange) -> str:
             if len(winners) != 1 or not isinstance(winners[0], dict):
                 sweep_uid = ""
                 break
-            uid = str(winners[0].get("user_id") or "").strip()
+            uid = canonical_user_id(str(winners[0].get("user_id") or "").strip())
             if not uid or (sweep_uid and uid != sweep_uid):
                 sweep_uid = ""
                 break
@@ -3276,7 +3264,7 @@ def _format_daily_report(facts: StatsFacts, *, dr: DateRange, games: List[str]) 
                 if not isinstance(outcome, dict):
                     continue
                 winners = outcome.get("winners") or []
-                uids = [str(w.get("user_id") or "").strip() for w in winners if isinstance(w, dict)]
+                uids = [canonical_user_id(str(w.get("user_id") or "").strip()) for w in winners if isinstance(w, dict)]
                 uids = [uid for uid in uids if uid]
                 if not uids:
                     continue
@@ -3303,13 +3291,20 @@ def _format_daily_report(facts: StatsFacts, *, dr: DateRange, games: List[str]) 
                 continue
             metric_type = entries[0].metric_type
             best_value = min(entries, key=lambda f: metric_sort_value(f.metric_value, f.metric_type)).metric_value
-            leaders = sorted({f.user_id for f in entries if f.metric_value == best_value})
+            valid_ranks = [f.rank for f in entries if isinstance(f.rank, int) and f.rank > 0]
+            if valid_ranks:
+                best_rank = min(valid_ranks)
+                leaders = sorted({f.user_id for f in entries if f.rank == best_rank})
+            else:
+                # Compatibility for manually constructed facts without ranks.
+                leaders = sorted({f.user_id for f in entries if f.metric_value == best_value})
             names = ", ".join(f"<@{uid}>" for uid in leaders)
             lines.append(f"- {game}: {names} ({_fmt_metric(metric_type, float(best_value))})")
     return "\n".join(lines)
 
 
 def _format_monthly_titles(store, *, uid: str, dr: DateRange) -> str:
+    uid = canonical_user_id(str(uid or "").strip())
     monthly_ws = getattr(store, "monthly", None)
     if monthly_ws is None:
         return f"*Monthly championships* for <@{uid}>\nMonthly results are unavailable."
@@ -3323,7 +3318,7 @@ def _format_monthly_titles(store, *, uid: str, dr: DateRange) -> str:
     if "month" not in header or "summary_json" not in header:
         return f"*Monthly championships* for <@{uid}>\nMonthly results are unavailable."
     month_i, summary_i = header.index("month"), header.index("summary_json")
-    titles: List[str] = []
+    latest_month_payloads: Dict[str, str] = {}
     for row in rows[1:]:
         month_key = (row[month_i] if month_i < len(row) else "").strip()
         if not re.fullmatch(r"\d{4}-\d{2}", month_key):
@@ -3332,19 +3327,48 @@ def _format_monthly_titles(store, *, uid: str, dr: DateRange) -> str:
         if not month_start or month_start < dr.start or month_start > dr.end:
             continue
         raw = (row[summary_i] if summary_i < len(row) else "").strip()
+        if raw:
+            # MonthlyResults is append-only; its last nonempty row is authoritative.
+            latest_month_payloads[month_key] = raw
+
+    titles: set[str] = set()
+    for month_key, raw in latest_month_payloads.items():
         try:
-            summary = json.loads(raw) if raw else {}
+            summary = json.loads(raw)
         except Exception:
             continue
-        champion = summary.get("champion") if isinstance(summary, dict) else None
-        winners = champion.get("user_ids") if isinstance(champion, dict) else None
-        if not isinstance(winners, list) and isinstance(summary, dict):
-            winners = [str(s.get("user_id") or "") for s in summary.get("standings") or [] if isinstance(s, dict) and int(s.get("place") or 0) == 1]
-        if uid in (winners or []):
-            titles.append(month_key)
+        facts = monthly_facts_from_summary(summary)
+        champion = facts.get("champion")
+        raw_winners = champion.get("user_ids") if isinstance(champion, dict) else None
+        winners = [
+            canonical_user_id(winner.strip())
+            for winner in raw_winners
+            if isinstance(winner, str) and winner.strip()
+        ] if isinstance(raw_winners, (list, tuple)) else []
+        winners = [winner for winner in winners if winner]
+        if not winners:
+            standings = facts.get("standings")
+            if isinstance(standings, list):
+                for standing in standings:
+                    if not isinstance(standing, dict):
+                        continue
+                    place = standing.get("place")
+                    if isinstance(place, bool):
+                        continue
+                    try:
+                        place_num = int(str(place).strip())
+                    except (TypeError, ValueError):
+                        continue
+                    user_id = standing.get("user_id")
+                    if place_num == 1 and isinstance(user_id, str) and user_id.strip():
+                        canonical_id = canonical_user_id(user_id.strip())
+                        if canonical_id:
+                            winners.append(canonical_id)
+        if uid in winners:
+            titles.add(month_key)
     lines = [f"*Monthly championships* for <@{uid}>", f"Range: {dr.start.isoformat()} to {dr.end.isoformat()}", f"- Recorded titles: {len(titles)}"]
     if titles:
-        lines.append(f"- Months: {', '.join(sorted(set(titles)))}")
+        lines.append(f"- Months: {', '.join(sorted(titles))}")
     return "\n".join(lines)
 
 

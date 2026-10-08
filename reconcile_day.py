@@ -199,7 +199,7 @@ def run_reconcile(
     channel: str = "",
     source_channel: str = "",
     force_repost: bool = False,
-    recap: bool = True,
+    recap: Optional[bool] = None,
     recap_only: bool = False,
     ai: Optional[bool] = None,
     recap_style: str = "",
@@ -220,6 +220,10 @@ def run_reconcile(
 
     if recap_only:
         recap = True
+    effective_recap = (
+        bool(getattr(bot, "POST_DAILY_RECAP", True))
+        if recap is None else bool(recap)
+    )
 
     rebuilt = replay_events_for_day(bot, day, source_channel=source_channel) if replay_events else 0
     if sync_slack_history:
@@ -253,7 +257,7 @@ def run_reconcile(
             msg = bot.format_summary(day, winners_by_game, awards_by_user, totals_map, best_display, players=players)
             day_msg_ts = message_ts(bot.client.chat_postMessage(channel=channel_id, text=msg))
 
-        if recap:
+        if effective_recap:
             try:
                 expected = bot.expected_players_for_day(day)
             except Exception:
@@ -286,7 +290,7 @@ def run_reconcile(
                 if patched_load_totals and callable(orig_load_totals):
                     store.load_totals_map = orig_load_totals  # type: ignore[assignment]
 
-            post_recap = bool(getattr(bot, "POST_DAILY_RECAP", True))
+            post_recap = effective_recap
             in_thread = bool(getattr(bot, "DAILY_RECAP_IN_THREAD", True))
             if post_recap and recap_text.strip():
                 if in_thread and day_msg_ts:
@@ -307,7 +311,14 @@ def run_reconcile(
         if already_posted and not force_finalize and (force_repost or recap_only or bool(channel.strip())):
             return rebuilt, _post_standings_only(channel_to_post)
 
-        status = bot.finalize_day(day, channel_to_post, post=True, force=bool(force_finalize))
+        status = bot.finalize_day(
+            day,
+            channel_to_post,
+            post=True,
+            force=bool(force_finalize),
+            post_scores=not recap_only,
+            post_recap=effective_recap,
+        )
         return rebuilt, status
 
     status = bot.finalize_day(day, channel="", post=False, force=bool(force_finalize))
@@ -333,12 +344,12 @@ def main():
         "--no-recap",
         dest="recap",
         action="store_false",
-        help="When re-posting (force-repost), do not post the recap message.",
+        help="Do not post the recap message.",
     )
     ap.add_argument(
         "--recap-only",
         action="store_true",
-        help="Post only the recap (no standings/scores message). Sets POST_DAILY_SCORES=0 and POST_DAILY_RECAP=1 for this run.",
+        help="Post only the recap (no standings/scores message).",
     )
     ap.add_argument(
         "--ai",
@@ -364,7 +375,7 @@ def main():
         help="Force finalization even if the day isn't 'ready' (still respects day boundary logic).",
     )
     ap.set_defaults(post=True)
-    ap.set_defaults(recap=True)
+    ap.set_defaults(recap=None)
     ap.set_defaults(ai=None)
     args = ap.parse_args()
 
@@ -377,7 +388,7 @@ def main():
         channel=args.channel,
         source_channel=(args.source_channel or ""),
         force_repost=bool(args.force_repost),
-        recap=bool(args.recap),
+        recap=args.recap,
         recap_only=bool(args.recap_only),
         ai=args.ai,
         recap_style=args.recap_style,

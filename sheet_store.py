@@ -23,7 +23,10 @@ from awards import AwardTally, unpack_awards
 from config import TZ, DAY_FMT
 from day_utils import _parse_day_key_loose
 from game_registry import _DEFAULT_GAMES
-from gsheets_safe import gspread_call, utc_now_iso, truncate_for_cell, spool_jsonl
+from gsheets_safe import (
+    JsonCellTooLargeError, gspread_call, utc_now_iso, truncate_for_cell,
+    serialize_json_for_cell, spool_jsonl,
+)
 from parser import ParsedScore, normalize_game, canonical_user_id
 from score_identity import score_identity
 
@@ -427,9 +430,21 @@ class SheetStore:
             self._event_cache.add(event_id)
         return True
 
+    def _spool_oversized_event(self, event_id: str, now: str, payload: dict) -> None:
+        logger.warning("Events payload exceeded the cell limit; full payload spooled locally")
+        spool_jsonl(
+            "events_spool.jsonl",
+            {"event_id": event_id, "ts": now, "payload": payload},
+        )
+        self._event_cache.add(event_id)
+
     def log_event(self, event_id: str, payload: dict) -> None:
         now = utc_now_iso()
-        payload_s = truncate_for_cell(json.dumps(payload, ensure_ascii=False))
+        try:
+            payload_s = serialize_json_for_cell(payload)
+        except JsonCellTooLargeError:
+            self._spool_oversized_event(event_id, now, payload)
+            return
         row = [event_id, now, payload_s]
 
         try:
@@ -463,7 +478,11 @@ class SheetStore:
                 continue
             seen_in_batch.add(event_id)
             now = utc_now_iso()
-            payload_s = truncate_for_cell(json.dumps(payload, ensure_ascii=False))
+            try:
+                payload_s = serialize_json_for_cell(payload)
+            except JsonCellTooLargeError:
+                self._spool_oversized_event(event_id, now, payload)
+                continue
             rows.append([event_id, now, payload_s])
             staged.append((event_id, now, payload))
 
@@ -1000,6 +1019,7 @@ class SheetStore:
             return k in self._posted_days_cache
 
     def _mark_day_posted_once(self, day: str, summary: dict) -> bool:
+        summary_s = serialize_json_for_cell(summary)
         self._ensure_cols(self.daily, self.REQUIRED_DAILY_COLS)
         rows = self.daily.get_all_values()
         header = [str(x or "").strip() for x in (rows[0] if rows else [])]
@@ -1022,12 +1042,12 @@ class SheetStore:
         row_vals = [""] * len(header)
         row_vals[idx["day"]] = (day or "").strip()
         row_vals[idx["posted_at"]] = datetime.now(TZ).isoformat()
-        row_vals[idx["summary_json"]] = json.dumps(summary)
+        row_vals[idx["summary_json"]] = summary_s
 
         self.daily.append_row(row_vals, value_input_option="RAW")
         return True
 
-    def mark_day_posted(self, day: str, summary: dict) -> None:
+    def mark_day_posted(self, day: str, summary: dict) -> bool:
         appended = self._write_with_backoff(
             "DailyResults.mark_day_posted",
             lambda: self._mark_day_posted_once(day, summary),
@@ -1035,6 +1055,7 @@ class SheetStore:
 
         if appended:
             self._cache_posted_day_key(day)
+        return bool(appended)
 
     def update_day_summary(self, day: str, updates: Dict[str, Any]) -> bool:
         """Patch summary_json for an already-posted day."""
@@ -1045,25 +1066,29 @@ class SheetStore:
         sum_i = header.index("summary_json")
         raw = (rows[target_row - 1][sum_i] or "").strip()
         try:
-            payload = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            payload = {}
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("DailyResults summary_json for %s is invalid; patch skipped", day)
+            return False
 
         if not isinstance(payload, dict):
-            payload = {}
+            logger.warning("DailyResults summary_json for %s is not an object; patch skipped", day)
+            return False
 
         for k, v in (updates or {}).items():
             payload[k] = v
 
+        payload_s = serialize_json_for_cell(payload)
         cell = gspread.utils.rowcol_to_a1(target_row, sum_i + 1)
         self._write_with_backoff(
             "DailyResults.update_day_summary",
-            lambda: self.daily.update(values=[[json.dumps(payload)]], range_name=cell),
+            lambda: self.daily.update(values=[[payload_s]], range_name=cell),
         )
         return True
 
     def replace_day_summary(self, day: str, summary: dict) -> bool:
         """Fully replace summary_json for an already-posted day (used by force re-finalize)."""
+        summary_s = serialize_json_for_cell(summary)
         target_row, rows, header = self._find_daily_row(day)
         if target_row is None:
             return False
@@ -1074,7 +1099,7 @@ class SheetStore:
         cell = gspread.utils.rowcol_to_a1(target_row, sum_i + 1)
         self._write_with_backoff(
             "DailyResults.replace_day_summary",
-            lambda: self.daily.update(values=[[json.dumps(summary)]], range_name=cell),
+            lambda: self.daily.update(values=[[summary_s]], range_name=cell),
         )
         if posted_i is not None:
             ts_cell = gspread.utils.rowcol_to_a1(target_row, posted_i + 1)
@@ -1186,6 +1211,7 @@ class SheetStore:
         return sorted(months)
 
     def _mark_month_posted_once(self, month: str, summary: dict) -> bool:
+        summary_s = serialize_json_for_cell(summary)
         self._ensure_cols(self.monthly, self.REQUIRED_MONTHLY_COLS)
         rows = self.monthly.get_all_values()
         header = [str(x or "").strip() for x in (rows[0] if rows else [])]
@@ -1208,7 +1234,7 @@ class SheetStore:
         row_vals = [""] * len(header)
         row_vals[month_i] = (month or "").strip()
         row_vals[idx["posted_at"]] = datetime.now(TZ).isoformat()
-        row_vals[sum_i] = truncate_for_cell(json.dumps(summary, ensure_ascii=False))
+        row_vals[sum_i] = summary_s
 
         self.monthly.append_row(row_vals, value_input_option="RAW")
         return True
@@ -1233,21 +1259,24 @@ class SheetStore:
         sum_i = header.index("summary_json")
         raw = (rows[target_row - 1][sum_i] or "").strip()
         try:
-            payload = json.loads(raw) if raw else {}
-        except json.JSONDecodeError:
-            payload = {}
+            payload = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("MonthlyResults summary_json for %s is invalid; patch skipped", month)
+            return False
 
         if not isinstance(payload, dict):
-            payload = {}
+            logger.warning("MonthlyResults summary_json for %s is not an object; patch skipped", month)
+            return False
 
         for k, v in (updates or {}).items():
             payload[k] = v
 
+        payload_s = serialize_json_for_cell(payload)
         cell = gspread.utils.rowcol_to_a1(target_row, sum_i + 1)
         self._write_with_backoff(
             "MonthlyResults.update_month_summary",
             lambda: self.monthly.update(
-                values=[[truncate_for_cell(json.dumps(payload, ensure_ascii=False))]],
+                values=[[payload_s]],
                 range_name=cell,
             ),
         )
@@ -1255,6 +1284,7 @@ class SheetStore:
 
     def replace_month_summary(self, month: str, summary: dict) -> bool:
         """Fully replace summary_json for an already-posted month (force re-finalize)."""
+        summary_s = serialize_json_for_cell(summary)
         target_row, _rows, header = self._find_monthly_row(month)
         if target_row is None:
             return False
@@ -1266,7 +1296,7 @@ class SheetStore:
         self._write_with_backoff(
             "MonthlyResults.replace_month_summary",
             lambda: self.monthly.update(
-                values=[[truncate_for_cell(json.dumps(summary, ensure_ascii=False))]],
+                values=[[summary_s]],
                 range_name=cell,
             ),
         )

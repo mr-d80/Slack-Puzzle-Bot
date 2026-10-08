@@ -12,6 +12,10 @@ from urllib3.exceptions import ProtocolError
 _GS_LOCK = threading.Lock()
 
 
+class JsonCellTooLargeError(ValueError):
+    """Raised when complete JSON cannot fit safely in a Google Sheets cell."""
+
+
 def utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
@@ -53,6 +57,24 @@ def truncate_for_cell(s: str, limit: int = 49000) -> str:
     if len(s) <= limit:
         return s
     return s[:limit] + "…(truncated)"
+
+
+def serialize_json_for_cell(value, limit: int = 49000) -> str:
+    """Serialize complete compact JSON that fits the Sheets cell limit.
+
+    JSON is ledger data and must never be truncated. Use a conservative UTF-16
+    size budget below the cell ceiling and fail before callers issue a ledger
+    write when the complete value is too large.
+    """
+    serialized = json.dumps(
+        value, ensure_ascii=False, separators=(",", ":"), allow_nan=False,
+    )
+    utf16_units = len(serialized.encode("utf-16-le", errors="surrogatepass")) // 2
+    if utf16_units > limit:
+        raise JsonCellTooLargeError(
+            f"Serialized JSON is {utf16_units} UTF-16 code units; conservative JSON cell budget is {limit}."
+        )
+    return serialized
 
 
 def spool_jsonl(path: str, record: dict) -> None:

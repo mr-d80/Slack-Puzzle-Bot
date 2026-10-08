@@ -79,7 +79,17 @@ def _bot(*, posted=False):
     def finalize_day(day, channel, **kwargs):
         store.finalize_calls.append((day, channel, kwargs))
         if kwargs.get("post"):
-            client.chat_postMessage(channel=channel, text="finalized")
+            day_ts = ""
+            if kwargs.get("post_scores", True):
+                day_ts = client.chat_postMessage(channel=channel, text="standings")["ts"]
+            post_recap = kwargs.get("post_recap")
+            if post_recap is None:
+                post_recap = bot.POST_DAILY_RECAP
+            if post_recap:
+                recap_kwargs = {"channel": channel, "text": "recap"}
+                if bot.DAILY_RECAP_IN_THREAD and day_ts:
+                    recap_kwargs["thread_ts"] = day_ts
+                client.chat_postMessage(**recap_kwargs)
         return "finalized"
 
     bot = SimpleNamespace(
@@ -158,9 +168,11 @@ class CliControlTests(unittest.TestCase):
 
         self.assertEqual(
             bot.store.finalize_calls,
-            [(DAY, "C-override", {"post": True, "force": True})],
+            [(DAY, "C-override", {
+                "post": True, "force": True, "post_scores": True, "post_recap": True,
+            })],
         )
-        self.assertEqual([post["text"] for post in bot.client.posts], ["finalized"])
+        self.assertEqual([post["text"] for post in bot.client.posts], ["standings", "recap"])
 
     def test_force_repost_posts_standings_and_respects_no_recap(self):
         bot = _bot(posted=True)
@@ -192,6 +204,60 @@ class CliControlTests(unittest.TestCase):
         self.assertEqual([post["text"] for post in bot.client.posts], ["recap"])
         self.assertEqual(bot.store.finalize_calls, [])
         self.assertFalse(hasattr(bot, "POST_DAILY_SCORES"))
+
+    def test_recap_only_repost_uses_explicit_recap_even_when_configured_off(self):
+        bot = _bot(posted=True)
+        bot.POST_DAILY_RECAP = False
+
+        reconcile_day.run_reconcile(
+            bot=bot,
+            day=DAY,
+            recap_only=True,
+            sync_slack_history=False,
+        )
+
+        self.assertEqual([post["text"] for post in bot.client.posts], ["recap"])
+        self.assertEqual(bot.store.finalize_calls, [])
+
+    def test_first_finalize_recap_only_uses_per_call_delivery_options(self):
+        bot = _bot()
+
+        reconcile_day.run_reconcile(
+            bot=bot,
+            day=DAY,
+            recap_only=True,
+            sync_slack_history=False,
+        )
+
+        self.assertEqual(
+            bot.store.finalize_calls,
+            [(DAY, "C1", {
+                "post": True, "force": False, "post_scores": False, "post_recap": True,
+            })],
+        )
+        self.assertEqual([post["text"] for post in bot.client.posts], ["recap"])
+
+    def test_first_finalize_no_recap_uses_per_call_delivery_option(self):
+        bot = _bot()
+
+        reconcile_day.run_reconcile(
+            bot=bot,
+            day=DAY,
+            recap=False,
+            sync_slack_history=False,
+        )
+
+        self.assertEqual(bot.store.finalize_calls[0][2]["post_recap"], False)
+        self.assertEqual([post["text"] for post in bot.client.posts], ["standings"])
+
+    def test_default_recap_setting_is_preserved_without_explicit_override(self):
+        bot = _bot()
+        bot.POST_DAILY_RECAP = False
+
+        reconcile_day.run_reconcile(bot=bot, day=DAY, sync_slack_history=False)
+
+        self.assertEqual(bot.store.finalize_calls[0][2]["post_recap"], False)
+        self.assertEqual([post["text"] for post in bot.client.posts], ["standings"])
 
     def test_reconcile_help_does_not_load_bot(self):
         with patch.object(sys, "argv", ["reconcile_day.py", "--help"]):
@@ -243,9 +309,11 @@ class CliControlTests(unittest.TestCase):
 
         self.assertEqual(
             bot.store.finalize_calls,
-            [(DAY, "C1", {"post": True, "force": False})],
+            [(DAY, "C1", {
+                "post": True, "force": False, "post_scores": True, "post_recap": True,
+            })],
         )
-        self.assertEqual([post["text"] for post in bot.client.posts], ["finalized"])
+        self.assertEqual([post["text"] for post in bot.client.posts], ["standings", "recap"])
 
 
 if __name__ == "__main__":

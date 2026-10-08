@@ -44,6 +44,8 @@ from day_utils import (
     _parse_day_key_loose, _parse_month_key,
 )
 from insights import build_monthly_recap_text, skunk_exclude_games, medal_scoring_facts
+from ledger_contracts import build_monthly_summary_payload
+from parser import canonical_user_id
 from scoring import compact_awards
 from score_metrics import metric_sort_value, record_is_dnf, metric_unit
 from slack_safe import message_ts
@@ -65,6 +67,7 @@ def _winner_uids(outcome: Any) -> List[str]:
     if not isinstance(outcome, dict):
         return []
     uids: List[str] = []
+    seen: Set[str] = set()
     metric_type = _winner_metric_type(outcome)
     best_value = _safe_int(outcome.get("best_value"))
     for w in outcome.get("winners") or []:
@@ -75,14 +78,15 @@ def _winner_uids(outcome: Any) -> List[str]:
                 record.setdefault("metric_value", best_value)
             if record_is_dnf(record):
                 continue
-            uid = str(w.get("user_id") or "").strip()
+            uid = canonical_user_id(str(w.get("user_id") or "").strip())
         else:
             if best_value is not None and record_is_dnf({
                 "metric_type": metric_type, "metric_value": best_value,
             }):
                 continue
-            uid = str(w or "").strip()
-        if uid:
+            uid = canonical_user_id(str(w or "").strip())
+        if uid and uid not in seen:
+            seen.add(uid)
             uids.append(uid)
     return uids
 
@@ -128,8 +132,11 @@ def _accumulate(payloads: Dict[str, Dict[str, Any]]) -> Dict[str, _PlayerMonth]:
     players: Dict[str, _PlayerMonth] = {}
     skunk_exclude = skunk_exclude_games()
 
-    def get(uid: str) -> _PlayerMonth:
-        return players.setdefault(uid, _PlayerMonth())
+    def get(uid: str) -> Optional[_PlayerMonth]:
+        normalized_uid = canonical_user_id(str(uid or "").strip())
+        if not normalized_uid:
+            return None
+        return players.setdefault(normalized_uid, _PlayerMonth())
 
     for day in sorted(payloads):
         payload = payloads[day] or {}
@@ -140,20 +147,29 @@ def _accumulate(payloads: Dict[str, Dict[str, Any]]) -> Dict[str, _PlayerMonth]:
         day_players = recap_facts.get("players")
         if not isinstance(day_players, list) or not day_players:
             day_players = list((payload.get("awards_by_user") or {}).keys())
-        for uid in day_players:
-            uid = str(uid or "").strip()
-            if uid:
-                get(uid).days_played += 1
+        seen_day_players: Set[str] = set()
+        for raw_uid in day_players:
+            uid = canonical_user_id(str(raw_uid or "").strip())
+            if uid and uid not in seen_day_players:
+                seen_day_players.add(uid)
+                player = get(uid)
+                if player is not None:
+                    player.days_played += 1
 
         # Awards, and best-single-day tracking. The best day is the one with the
         # highest tally (points for medal days, wins then ties for legacy days);
         # the earliest wins a tie.
-        for uid, v in (payload.get("awards_by_user") or {}).items():
-            uid = str(uid or "").strip()
-            if not uid:
-                continue
+        canonical_awards: Dict[str, Any] = {}
+        for raw_uid, v in (payload.get("awards_by_user") or {}).items():
+            uid = canonical_user_id(str(raw_uid or "").strip())
+            if uid:
+                # Alias collisions retain the last entry, matching dict overwrite semantics.
+                canonical_awards[uid] = v
+        for uid, v in canonical_awards.items():
             day_tally = unpack_awards(v)
             p = get(uid)
+            if p is None:
+                continue
             p.tally = p.tally + day_tally
             if day_tally.rank_key > p.best_day_tally.rank_key:
                 p.best_day, p.best_day_tally = day, day_tally
@@ -168,15 +184,22 @@ def _accumulate(payloads: Dict[str, Dict[str, Any]]) -> Dict[str, _PlayerMonth]:
                 valid_winners = set(_winner_uids(outcome))
                 for entry in podium:
                     if isinstance(entry, dict) and entry.get("place") == 1:
+                        seen_podium_winners: Set[str] = set()
                         for uid in entry.get("user_ids") or []:
-                            uid = str(uid or "").strip()
-                            if uid and uid in valid_winners:
-                                g = get(uid).gold_by_game
+                            uid = canonical_user_id(str(uid or "").strip())
+                            if uid and uid in valid_winners and uid not in seen_podium_winners:
+                                seen_podium_winners.add(uid)
+                                player = get(uid)
+                                if player is None:
+                                    continue
+                                g = player.gold_by_game
                                 g[game] = g.get(game, 0) + 1
                 continue
             tied = str(outcome.get("result") or "") == "tie"
             for uid in _winner_uids(outcome):
                 p = get(uid)
+                if p is None:
+                    continue
                 if tied:
                     p.ties_by_game[game] = p.ties_by_game.get(game, 0) + 1
                 else:
@@ -189,10 +212,15 @@ def _accumulate(payloads: Dict[str, Dict[str, Any]]) -> Dict[str, _PlayerMonth]:
         # one is stored), so an excluded day simply contributes nothing.
         skunk = recap_facts.get("skunk")
         if isinstance(skunk, dict) and str(skunk.get("game") or "") not in skunk_exclude:
+            seen_skunk_uids: Set[str] = set()
             for uid in skunk.get("last_uids") or []:
-                uid = str(uid or "").strip()
-                if uid:
-                    get(uid).skunks += 1
+                uid = canonical_user_id(str(uid or "").strip())
+                if not uid or uid in seen_skunk_uids:
+                    continue
+                seen_skunk_uids.add(uid)
+                player = get(uid)
+                if player is not None:
+                    player.skunks += 1
 
     return players
 
@@ -513,7 +541,14 @@ def build_monthly_facts(
 # Rendering
 # ---------------------------------------------------------------------------
 def _tags(uids: List[str]) -> str:
-    return ", ".join(f"<@{u}>" for u in uids)
+    normalized: List[str] = []
+    seen: Set[str] = set()
+    for value in uids:
+        uid = canonical_user_id(str(value or "").strip())
+        if uid and uid not in seen:
+            seen.add(uid)
+            normalized.append(uid)
+    return ", ".join(f"<@{uid}>" for uid in normalized)
 
 
 def _is_medal_facts(facts: Dict[str, Any]) -> bool:
@@ -793,12 +828,7 @@ def finalize_month(
     standings_text = render_monthly_standings_text(facts)
     recap_text = build_monthly_recap_text(facts)
 
-    summary_payload = {
-        "month": month,
-        "facts": facts,
-        "standings_text": standings_text,
-        "recap_text": recap_text,
-    }
+    summary_payload = build_monthly_summary_payload(month, facts, standings_text, recap_text)
 
     if already:
         store.replace_month_summary(month, summary_payload)

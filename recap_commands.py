@@ -450,6 +450,11 @@ def _looks_like_not_ready(status: str) -> bool:
     return s in ("not_ready", "not ready") or "not_ready" in s or "not ready" in s
 
 
+def _looks_like_already_posted(status: str) -> bool:
+    s = (status or "").strip().lower().replace("-", "_").replace(" ", "_")
+    return s in ("already_posted", "already_finalized")
+
+
 def register_recap_commands(app: Any, bot_module: Any) -> None:
     @app.command("/jw-recap")
     def _jw_recap(ack, respond, body, client, logger):  # type: ignore[no-redef]
@@ -502,6 +507,14 @@ def register_recap_commands(app: Any, bot_module: Any) -> None:
                     respond(
                         f"Finalize refused for {day}: **not_ready**.\n"
                         f"Meaning: the bot decided the day isn't complete yet (missing scores / still in progress), so nothing was posted."
+                    )
+                    return
+
+                if _looks_like_already_posted(status):
+                    respond(
+                        f"{day} was finalized while this request was running. "
+                        f"Use `/jw-recap {day} --repost` to repost the stored recap, "
+                        f"or `/jw-recap {day} --force` to re-finalize with fresh data."
                     )
                     return
 

@@ -92,8 +92,27 @@ def _looks_like_nl_query(text: str) -> bool:
 # (so slash commands and utility scripts can call finalize_day(day, channel)
 # with the same signature as the original monolith).
 # ---------------------------------------------------------------------------
-def finalize_day(day, channel, post=True, force=False, now_utc=None):
-    return _finalize_day_impl(day, channel, store, client, post=post, force=force, now_utc=now_utc)
+def finalize_day(
+    day,
+    channel,
+    post=True,
+    force=False,
+    now_utc=None,
+    *,
+    post_scores=True,
+    post_recap=None,
+):
+    return _finalize_day_impl(
+        day,
+        channel,
+        store,
+        client,
+        post=post,
+        force=force,
+        now_utc=now_utc,
+        post_scores=post_scores,
+        post_recap=post_recap,
+    )
 
 
 def finalize_due_days(channel, post=True):
