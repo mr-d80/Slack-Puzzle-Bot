@@ -1,0 +1,26 @@
+{
+  "display_information": {
+    "name": "Puzzle Tracker",
+    "description": "Daily puzzle standings for your friends",
+    "background_color": "#225566"
+  },
+  "features": {
+    "bot_user": {"display_name": "Puzzle Tracker", "always_online": false},
+    "slash_commands": [
+      {"command": "/jw-recap", "description": "Finalize or repost a daily recap", "usage_hint": "[YYYY-MM-DD] [--repost|--force]", "should_escape": false},
+      {"command": "/jw-update", "description": "Add a game or reconcile scores", "usage_hint": "new game: GameName, time | reconcile [YYYY-MM-DD]", "should_escape": false}
+    ]
+  },
+  "oauth_config": {
+    "scopes": {
+      "bot": ["chat:write", "commands", "channels:history", "groups:history", "users:read"]
+    }
+  },
+  "settings": {
+    "event_subscriptions": {"bot_events": ["message.channels", "message.groups"]},
+    "interactivity": {"is_enabled": true},
+    "socket_mode_enabled": true,
+    "org_deploy_enabled": false,
+    "token_rotation_enabled": false
+  }
+}

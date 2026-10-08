@@ -1,0 +1,8 @@
+slack-bolt==1.21.1
+slack-sdk==3.33.4
+gspread==6.2.1
+google-auth==2.27.0
+python-dotenv==1.2.2
+tzdata==2026.5
+requests==2.33.0
+urllib3==2.8.0
