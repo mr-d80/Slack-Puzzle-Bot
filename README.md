@@ -99,6 +99,11 @@ Set `TZ_NAME` and `SCORE_DAY_TZ_NAME` to your group's IANA timezone, such as
 `Europe/London`. Relative credential paths resolve from the project directory.
 Deployment environment variables override `.env` values.
 
+The optional settings in [.env.example](.env.example) document AI model selection,
+API mode, reasoning effort, output-token limits, recap style, text verbosity,
+and tightest-race exclusions. Their comments explain defaults and which features
+each setting affects.
+
 Set `PLAYERS_EXPECTED` to your initial group size. After the first day, the bot
 expects the number of people who posted any score yesterday. A player is
 complete when they have submitted every game active for that day. If your group
