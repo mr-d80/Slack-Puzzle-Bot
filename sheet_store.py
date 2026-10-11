@@ -13,10 +13,10 @@ import logging
 import threading
 import time
 from datetime import datetime
+import math
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import gspread
-from gspread.exceptions import APIError
 from google.oauth2.service_account import Credentials
 
 from awards import AwardTally, unpack_awards
@@ -25,7 +25,8 @@ from day_utils import _parse_day_key_loose
 from game_registry import _DEFAULT_GAMES
 from gsheets_safe import (
     JsonCellTooLargeError, gspread_call, utc_now_iso, truncate_for_cell,
-    serialize_json_for_cell, spool_jsonl,
+    serialize_json_for_cell, spool_jsonl, is_retriable_sheets_error,
+    response_status_code, retry_after_seconds, operation_label,
 )
 from parser import ParsedScore, normalize_game, canonical_user_id
 from score_identity import score_identity
@@ -49,36 +50,16 @@ def extract_awards_from_summary(payload: Any) -> Optional[Dict[str, Any]]:
 
 
 def _api_error_status(exc: Exception) -> Optional[int]:
-    resp = getattr(exc, "response", None)
-    if resp is None:
-        return None
-
-    for attr in ("status_code", "status"):
-        raw = getattr(resp, attr, None)
-        if raw is None:
-            continue
-        try:
-            return int(raw)
-        except Exception:
-            continue
-
-    return None
+    return response_status_code(exc)
 
 
-def _api_error_retry_after(exc: Exception) -> Optional[float]:
-    resp = getattr(exc, "response", None)
-    headers = getattr(resp, "headers", None)
-    if not headers:
-        return None
-
-    raw = headers.get("Retry-After") or headers.get("retry-after")
-    if not raw:
-        return None
-
+def _positive_timeout_from_env(name: str, default: float) -> float:
+    """Read a finite positive timeout value, falling back on invalid input."""
     try:
-        return float(raw)
-    except Exception:
-        return None
+        value = float(os.getenv(name, str(default)))
+    except (TypeError, ValueError, OverflowError):
+        return default
+    return value if math.isfinite(value) and value > 0 else default
 
 
 # ---------------------------------------------------------------------------
@@ -109,16 +90,29 @@ class SheetStore:
         scopes = ["https://www.googleapis.com/auth/spreadsheets"]
         creds = Credentials.from_service_account_file(sa_file, scopes=scopes)
         self.gc = gspread.authorize(creds)
-        self.ss = self.gc.open_by_key(spreadsheet_id)
 
-        # --- Sheets read throttle protection (prevents 429 storms) ---
+        connect_timeout = _positive_timeout_from_env("SHEETS_CONNECT_TIMEOUT_S", 10.0)
+        read_timeout = _positive_timeout_from_env("SHEETS_READ_TIMEOUT_S", 30.0)
+        timeout = (connect_timeout, read_timeout)
+        set_timeout = getattr(self.gc, "set_timeout", None)
+        if callable(set_timeout):
+            set_timeout(timeout)
+        else:
+            # Older gspread clients expose the timeout only on their HTTP client.
+            http_client = getattr(self.gc, "http_client", None)
+            http_set_timeout = getattr(http_client, "set_timeout", None)
+            if callable(http_set_timeout):
+                http_set_timeout(timeout)
+
+        # Initialize retry helpers before open_by_key and bootstrap worksheet
+        # reads so transient startup failures use the same bounded policy.
         self._posted_days_cache: Set[str] = set()
         self._posted_days_cache_ts: float = 0.0
+        self._posted_days_cache_loaded: bool = False
         self._daily_header_cache: List[str] = []
         self._daily_header_cache_ts: float = 0.0
         self._daily_cache_lock = threading.Lock()
 
-        # Tunables (env overrides)
         self._posted_days_cache_ttl_s: int = int(os.getenv("SHEETS_POSTED_DAYS_CACHE_TTL_S", "60"))
         self._daily_header_cache_ttl_s: int = int(os.getenv("SHEETS_DAILY_HEADER_CACHE_TTL_S", "300"))
         self._sheets_429_max_retries: int = int(os.getenv("SHEETS_429_MAX_RETRIES", "6"))
@@ -126,9 +120,12 @@ class SheetStore:
         self._sheets_429_max_delay_s: float = float(os.getenv("SHEETS_429_MAX_DELAY_S", "10.0"))
 
         self._write_lock = threading.RLock()
+        self._write_retry_context = threading.local()
         self._sheets_write_max_retries: int = int(os.getenv("SHEETS_WRITE_MAX_RETRIES", "6"))
         self._sheets_write_base_delay_s: float = float(os.getenv("SHEETS_WRITE_BASE_DELAY_S", "1.0"))
         self._sheets_write_max_delay_s: float = float(os.getenv("SHEETS_WRITE_MAX_DELAY_S", "10.0"))
+
+        self.ss = self._read_with_backoff(lambda: self.gc.open_by_key(spreadsheet_id))
 
         # Create missing tabs for a fresh public spreadsheet, while preserving
         # any existing tabs and their data. The row counts leave room for normal
@@ -149,7 +146,7 @@ class SheetStore:
     def _get_or_create_worksheet(self, title: str, required_cols: List[str], rows: int):
         """Return an existing worksheet, creating it only when it is missing."""
         try:
-            return self.ss.worksheet(title)
+            return self._read_with_backoff(lambda: self.ss.worksheet(title))
         except gspread.exceptions.WorksheetNotFound:
             return self.ss.add_worksheet(title=title, rows=rows, cols=len(required_cols))
 
@@ -166,21 +163,32 @@ class SheetStore:
 
     def _seed_registry_if_empty(self) -> None:
         """Populate the GameRegistry sheet with _DEFAULT_GAMES if it has no data rows."""
-        rows = self.registry.get_all_values()
+        rows = self._read_with_backoff(self.registry.get_all_values)
         if len(rows) > 1:
             return  # already has data
         seed_rows = [
             [name, mt, "2020-01-01", "system"]
             for name, mt in _DEFAULT_GAMES
         ]
+
+        def seed_if_still_empty() -> bool:
+            # Recheck inside every write attempt. If an append reached Sheets
+            # but its response was lost, the retry sees the seeded rows and
+            # does not append a second copy.
+            current_rows = self._read_with_backoff(self.registry.get_all_values)
+            if len(current_rows) > 1:
+                return False
+            self.registry.append_rows(seed_rows, value_input_option="RAW")
+            return True
+
         self._write_with_backoff(
             "GameRegistry.seed",
-            lambda: self.registry.append_rows(seed_rows, value_input_option="RAW"),
+            seed_if_still_empty,
         )
 
     def load_game_registry(self) -> List[Tuple[str, str, str]]:
         """Return list of (game_name, metric_type, effective_date) from the GameRegistry sheet."""
-        rows = self.registry.get_all_values()
+        rows = self._read_with_backoff(self.registry.get_all_values)
         if len(rows) <= 1:
             return [(name, mt, "2020-01-01") for name, mt in _DEFAULT_GAMES]
         header = [h.strip().lower() for h in rows[0]]
@@ -215,13 +223,23 @@ class SheetStore:
             if name.lower() == game_name.strip().lower():
                 raise ValueError(f"Game '{game_name}' is already registered.")
         row = [game_name.strip(), metric_type.strip().lower(), effective_date, added_by]
+
+        def append_if_still_missing() -> bool:
+            # The preflight above gives a quick duplicate error. This second
+            # check makes an append retry safe after a lost success response.
+            current = self.load_game_registry()
+            if any(name.lower() == game_name.strip().lower() for name, _, _ in current):
+                return False
+            self.registry.append_rows([row], value_input_option="RAW")
+            return True
+
         self._write_with_backoff(
             "GameRegistry.add_game",
-            lambda: self.registry.append_rows([row], value_input_option="RAW"),
+            append_if_still_missing,
         )
 
     def _ensure_cols(self, ws, required: List[str]) -> None:
-        header = ws.row_values(1)
+        header = self._read_with_backoff(lambda: ws.row_values(1))
         if not header:
             grid_cols = getattr(ws, "col_count", None)
             if isinstance(grid_cols, int) and grid_cols < len(required):
@@ -258,7 +276,7 @@ class SheetStore:
         )
 
     def _load_recent_event_ids(self, limit: int) -> List[str]:
-        rows = self.events.get_all_values()
+        rows = self._read_with_backoff(self.events.get_all_values)
         if len(rows) <= 1:
             return []
         header = rows[0]
@@ -273,28 +291,59 @@ class SheetStore:
 
     # ---- Sheets rate-limit helpers ----
     def _is_sheets_429(self, err: Exception) -> bool:
+        status = _api_error_status(err)
+        if status is not None:
+            return status == 429
         s = str(err)
         return ("[429]" in s) or ("Quota exceeded" in s and "Read requests" in s)
 
     def _read_with_backoff(self, fn):
-        """Run a Sheets read callable with exponential backoff on 429s."""
-        max_retries = self._sheets_429_max_retries
-        base = self._sheets_429_base_delay_s
-        max_delay = self._sheets_429_max_delay_s
+        """Retry bounded transient Sheets reads and network failures."""
+        max_retries = max(0, int(getattr(self, "_sheets_429_max_retries", 6)))
+        retry_context = getattr(self, "_write_retry_context", None)
+        if getattr(retry_context, "active", False):
+            # Let the enclosing write attempt own recovery for reads performed
+            # as part of a write operation, avoiding nested retry multiplication.
+            max_retries = 0
+        base = max(0.0, float(getattr(self, "_sheets_429_base_delay_s", 0.5)))
+        max_delay = max(0.0, float(getattr(self, "_sheets_429_max_delay_s", 10.0)))
+        operation = operation_label(fn)
 
         for attempt in range(max_retries + 1):
             try:
                 return fn()
             except Exception as e:
-                if (not self._is_sheets_429(e)) or attempt >= max_retries:
+                status = _api_error_status(e)
+                retryable = (
+                    is_retriable_sheets_error(e)
+                    if status is not None else
+                    is_retriable_sheets_error(e) or self._is_sheets_429(e)
+                )
+                if not retryable:
                     raise
-                delay = min(max_delay, base * (2 ** attempt))
-                jitter = random.uniform(0.0, delay * 0.15)
-                time.sleep(delay + jitter)
+                if attempt >= max_retries:
+                    logger.warning(
+                        "Sheets read operation %s exhausted %s retries (status=%s, error_type=%s)",
+                        operation, max_retries, status, type(e).__name__,
+                    )
+                    raise
+                sleep_s = retry_after_seconds(e, max_delay) if status == 429 else None
+                if sleep_s is None:
+                    delay = min(max_delay, base * (2 ** attempt))
+                    jitter = random.uniform(0.0, delay * 0.15)
+                    sleep_s = min(max_delay, delay + jitter)
+                logger.warning(
+                    "Sheets read operation %s failed (status=%s, error_type=%s) on attempt %s/%s; retrying in %.2fs",
+                    operation, status, type(e).__name__, attempt + 1,
+                    max_retries + 1, sleep_s,
+                )
+                time.sleep(sleep_s)
 
     def _is_retryable_write_error(self, err: Exception) -> bool:
         status = _api_error_status(err)
-        if status in (429, 500, 502, 503, 504):
+        if status is not None:
+            return is_retriable_sheets_error(err)
+        if is_retriable_sheets_error(err):
             return True
 
         s = str(err or "").lower()
@@ -305,36 +354,55 @@ class SheetStore:
         return False
 
     def _write_with_backoff(self, op_name: str, fn):
-        max_retries = self._sheets_write_max_retries
-        base = self._sheets_write_base_delay_s
-        max_delay = self._sheets_write_max_delay_s
+        retry_context = getattr(self, "_write_retry_context", None)
+        if getattr(retry_context, "active", False):
+            # Nested schema writes are part of the same logical operation; let
+            # its outer retry own recovery instead of multiplying budgets.
+            with getattr(self, "_write_lock", threading.RLock()):
+                return fn()
+
+        max_retries = int(getattr(self, "_sheets_write_max_retries", 6))
+        base = max(0.0, float(getattr(self, "_sheets_write_base_delay_s", 1.0)))
+        max_delay = max(0.0, float(getattr(self, "_sheets_write_max_delay_s", 10.0)))
         last_exc: Optional[Exception] = None
 
         for attempt in range(1, max_retries + 1):
             try:
-                with self._write_lock:
-                    return fn()
-            except APIError as e:
-                if not self._is_retryable_write_error(e):
-                    raise
-                last_exc = e
+                with getattr(self, "_write_lock", threading.RLock()):
+                    retry_context = getattr(self, "_write_retry_context", None)
+                    if retry_context is None:
+                        retry_context = threading.local()
+                        self._write_retry_context = retry_context
+                    previous_active = getattr(retry_context, "active", False)
+                    retry_context.active = True
+                    try:
+                        return fn()
+                    finally:
+                        retry_context.active = previous_active
             except Exception as e:
-                status = _api_error_status(e)
-                if status is None or (not self._is_retryable_write_error(e)):
+                if not self._is_retryable_write_error(e):
                     raise
                 last_exc = e
 
             if attempt >= max_retries:
+                logger.warning(
+                    "Sheets write operation %s exhausted %s attempts (status=%s, error_type=%s)",
+                    op_name, max_retries, _api_error_status(last_exc), type(last_exc).__name__,
+                )
                 break
 
-            retry_after = _api_error_retry_after(last_exc) if last_exc else None
-            delay = retry_after if (retry_after is not None and retry_after > 0) else min(max_delay, base * (2 ** (attempt - 1)))
-            jitter = random.uniform(0.0, min(0.35, delay * 0.15))
-            sleep_s = delay + jitter
+            status = _api_error_status(last_exc) if last_exc else None
+            sleep_s = retry_after_seconds(last_exc, max_delay) if last_exc and status == 429 else None
+            if sleep_s is None:
+                delay = min(max_delay, base * (2 ** (attempt - 1)))
+                jitter = random.uniform(0.0, min(0.35, delay * 0.15))
+                sleep_s = min(max_delay, delay + jitter)
 
             logger.warning(
-                "Sheets write failed during %s on attempt %s/%s; retrying in %.2fs",
+                "Sheets write operation %s failed (status=%s, error_type=%s) on attempt %s/%s; retrying in %.2fs",
                 op_name,
+                status,
+                type(last_exc).__name__ if last_exc else "UnknownError",
                 attempt,
                 max_retries,
                 sleep_s,
@@ -378,7 +446,11 @@ class SheetStore:
     def _refresh_posted_days_cache(self, force: bool = False) -> None:
         now = time.time()
         with self._daily_cache_lock:
-            if (not force) and self._posted_days_cache and (now - self._posted_days_cache_ts) < self._posted_days_cache_ttl_s:
+            if (
+                (not force)
+                and getattr(self, "_posted_days_cache_loaded", False)
+                and (now - self._posted_days_cache_ts) < self._posted_days_cache_ttl_s
+            ):
                 return
 
         header = self._get_daily_header(force=False)
@@ -411,6 +483,7 @@ class SheetStore:
         with self._daily_cache_lock:
             self._posted_days_cache = posted
             self._posted_days_cache_ts = now
+            self._posted_days_cache_loaded = True
 
     def get_posted_days_snapshot(self, force_refresh: bool = False) -> Set[str]:
         self._refresh_posted_days_cache(force=force_refresh)
@@ -797,7 +870,7 @@ class SheetStore:
         return self._write_with_backoff("Scores.bulk_upsert_scores", _flush)
 
     def list_days_with_scores(self) -> List[str]:
-        rows = self.scores.get_all_values()
+        rows = self._read_with_backoff(self.scores.get_all_values)
         if len(rows) <= 1:
             return []
         header = rows[0]
@@ -930,7 +1003,7 @@ class SheetStore:
         ))
 
     def load_scores_for_day(self, day: str) -> List[dict]:
-        rows = self.scores.get_all_values()
+        rows = self._read_with_backoff(self.scores.get_all_values)
         if len(rows) <= 1:
             return []
         header = rows[0]
@@ -952,7 +1025,7 @@ class SheetStore:
 
         Returns (target_row_1based_or_None, all_rows, header).
         """
-        rows = self.daily.get_all_values()
+        rows = self._read_with_backoff(self.daily.get_all_values)
         if len(rows) <= 1:
             return None, rows, []
         header = rows[0]
@@ -1125,7 +1198,7 @@ class SheetStore:
         if end < start:
             start, end = end, start
 
-        rows = self.daily.get_all_values()
+        rows = self._read_with_backoff(self.daily.get_all_values)
         if len(rows) <= 1:
             return {}
 
@@ -1161,7 +1234,7 @@ class SheetStore:
 
         Returns (target_row_1based_or_None, all_rows, header).
         """
-        rows = self.monthly.get_all_values()
+        rows = self._read_with_backoff(self.monthly.get_all_values)
         if len(rows) <= 1:
             return None, rows, []
         header = rows[0]
@@ -1188,7 +1261,7 @@ class SheetStore:
         k = (month or "").strip()
         if not k:
             return False
-        target_row, _rows, _header = self._read_with_backoff(lambda: self._find_monthly_row(k))
+        target_row, _rows, _header = self._find_monthly_row(k)
         return target_row is not None
 
     def list_posted_months(self) -> List[str]:
@@ -1323,7 +1396,7 @@ class SheetStore:
         from scoring import compute_daily_winners
         from insights import build_daily_facts, build_daily_recap_text
 
-        rows = self.scores.get_all_values()
+        rows = self._read_with_backoff(self.scores.get_all_values)
         if len(rows) <= 1:
             return 0
         header = rows[0]
@@ -1388,7 +1461,7 @@ class SheetStore:
 
     def rebuild_totals_from_daily(self) -> None:
         """Totals is derived from DailyResults.summary_json."""
-        daily_rows = self.daily.get_all_values()
+        daily_rows = self._read_with_backoff(self.daily.get_all_values)
         if len(daily_rows) <= 1:
             return
 
@@ -1402,27 +1475,30 @@ class SheetStore:
         if not has_any:
             n = self.backfill_daily_ledger_from_scores()
             if n:
-                daily_rows = self.daily.get_all_values()
+                daily_rows = self._read_with_backoff(self.daily.get_all_values)
                 daily_header = daily_rows[0]
                 sum_i = daily_header.index("summary_json")
 
         totals = self._aggregate_awards_from_rows(daily_rows[1:], sum_i)
 
         # Ensure totals header
-        tot_rows = self.totals.get_all_values()
+        tot_rows = self._read_with_backoff(self.totals.get_all_values)
         if not tot_rows:
             self._write_with_backoff("Totals.ensure_header", lambda: self.totals.update(values=[self.REQUIRED_TOTALS_COLS], range_name="A1"))
-            tot_rows = self.totals.get_all_values()
+            tot_rows = self._read_with_backoff(self.totals.get_all_values)
 
         self._ensure_cols(self.totals, self.REQUIRED_TOTALS_COLS)
-        tot_header = self.totals.row_values(1)
+        tot_header = self._read_with_backoff(lambda: self.totals.row_values(1))
         idx = {name: tot_header.index(name) for name in tot_header if name in tot_header}
 
-        if self.totals.row_count > 1:
-            try:
-                self._write_with_backoff("Totals.delete_rows", lambda: self.totals.delete_rows(2, self.totals.row_count))
-            except Exception:
-                self._write_with_backoff("Totals.batch_clear", lambda: self.totals.batch_clear(["A2:Z1000"]))
+        row_count = max(1, int(getattr(self.totals, "row_count", 1)))
+        last_col = self._col_letter(len(tot_header))
+        if row_count > 1:
+            data_range = f"A2:{last_col}{row_count}"
+            self._write_with_backoff(
+                "Totals.clear_data",
+                lambda: self.totals.batch_clear([data_range]),
+            )
 
         out_rows = []
         for uid in sorted(totals):
@@ -1438,7 +1514,16 @@ class SheetStore:
             out_rows.append(row)
 
         if out_rows:
-            self._write_with_backoff("Totals.append_rows", lambda: self.totals.append_rows(out_rows, value_input_option="RAW"))
+            required_rows = len(out_rows) + 1
+            if row_count < required_rows:
+                self._write_with_backoff(
+                    "Totals.resize",
+                    lambda: self.totals.resize(rows=required_rows),
+                )
+            self._write_with_backoff(
+                "Totals.update_rows",
+                lambda: self.totals.update(values=out_rows, range_name="A2", raw=True),
+            )
 
     def load_monthly_totals_map(self, month_start_day: str, month_end_day: str) -> Dict[str, Dict[str, int]]:
         """Aggregate awards from DailyResults.summary_json for an inclusive day-key range.
@@ -1452,7 +1537,7 @@ class SheetStore:
         if end < start:
             start, end = end, start
 
-        rows = self.daily.get_all_values()
+        rows = self._read_with_backoff(self.daily.get_all_values)
         if len(rows) <= 1:
             return {}
 
@@ -1482,7 +1567,7 @@ class SheetStore:
         Columns the sheet doesn't have yet (the medal columns, before the first
         rebuild after the cut-over) read as zero.
         """
-        rows = self.totals.get_all_values()
+        rows = self._read_with_backoff(self.totals.get_all_values)
         if len(rows) <= 1:
             return {}
         header = rows[0]

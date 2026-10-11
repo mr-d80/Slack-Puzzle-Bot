@@ -23,6 +23,8 @@ All business logic lives in dedicated modules:
 import sys
 import types
 import time
+import logging
+from pathlib import Path
 from datetime import datetime
 
 from slack_bolt import App
@@ -49,6 +51,8 @@ try:
 except ValueError as exc:
     raise SystemExit(str(exc)) from None
 
+from diagnostics import log_runtime_info
+
 from game_registry import game_registry, _DEFAULT_GAMES, GameRegistryCache
 from parser import (
     ParsedScore, parse_score, parse_score_for_day, normalize_game, canonical_user_id,
@@ -71,7 +75,7 @@ from monthly_summary import (
     finalize_due_months as _finalize_due_months_impl,
     build_monthly_facts, load_month_facts, render_monthly_standings_text,
 )
-from gsheets_safe import utc_now_iso, spool_jsonl
+from gsheets_safe import utc_now_iso, spool_jsonl, response_status_code
 from insights import build_daily_facts, build_daily_recap_text, build_monthly_recap_text
 from nl_query import is_nl_query_text, answer_nl_query
 
@@ -130,6 +134,7 @@ def finalize_due_months(channel, post=True, now_utc=None):
 # ---------------------------------------------------------------------------
 # Slack app + globals
 # ---------------------------------------------------------------------------
+log_runtime_info(logging.getLogger("score-bot"), Path(__file__).resolve().parent)
 app = App(token=SLACK_BOT_TOKEN)
 client = WebClient(token=SLACK_BOT_TOKEN)
 store = SheetStore(SPREADSHEET_ID, GOOGLE_SA_FILE)
@@ -193,6 +198,71 @@ game_registry.rebuild(store)
 # ---------------------------------------------------------------------------
 # Message handler
 # ---------------------------------------------------------------------------
+def _parsed_score_for_spool(parsed):
+    if parsed is None:
+        return None
+    return {
+        "game": getattr(parsed, "game", None),
+        "puzzle_id": getattr(parsed, "puzzle_id", None),
+        "metric_type": getattr(parsed, "metric_type", None),
+        "metric_value": getattr(parsed, "metric_value", None),
+        "display": getattr(parsed, "display", None),
+        "tiebreak_value": getattr(parsed, "tiebreak_value", None),
+        "status": getattr(parsed, "status", ""),
+        "score_day": getattr(parsed, "score_day", None),
+    }
+
+
+def _redact_payload_secrets(value):
+    secret_keys = {"token", "authorization", "access_token", "bot_token", "bot_access_token", "user_token"}
+    if isinstance(value, dict):
+        return {
+            key: _redact_payload_secrets(item)
+            for key, item in value.items()
+            if str(key).casefold() not in secret_keys
+        }
+    if isinstance(value, list):
+        return [_redact_payload_secrets(item) for item in value]
+    return value
+
+
+def _spool_ingestion_failure(
+    body, event_id, message_day, resolved_day, user_id, slack_ts, parsed,
+    text, failed_stage, exc, logger,
+):
+    logger.error(
+        "Score ingestion failed stage=%s message_day=%s user=%s event_id=%s error_type=%s",
+        failed_stage,
+        message_day,
+        user_id,
+        event_id,
+        type(exc).__name__,
+    )
+    record = {
+        "message_day": message_day,
+        "resolved_day": resolved_day,
+        "day": resolved_day,
+        "event_id": event_id,
+        "payload": _redact_payload_secrets(body),
+        "raw_text": text,
+        "user_id": user_id,
+        "slack_ts": slack_ts,
+        "parsed": _parsed_score_for_spool(parsed),
+        "failed_stage": failed_stage,
+        "error_type": type(exc).__name__,
+        "http_status": response_status_code(exc),
+        "logged_at": utc_now_iso(),
+    }
+    try:
+        spool_jsonl(str(Path(__file__).resolve().parent / "scores_spool.jsonl"), record)
+    except Exception as spool_exc:
+        logger.error(
+            "Failed to spool score ingestion event_id=%s error_type=%s",
+            event_id,
+            type(spool_exc).__name__,
+        )
+
+
 @app.event("message")
 def handle_message(body, event, logger):
     # Keep the shared Events ledger limited to human messages from the single
@@ -238,18 +308,29 @@ def handle_message(body, event, logger):
             return
         store.log_event(event_id, body)
 
-    message_day = day_key_from_ts(slack_ts)
-    parsed = parse_score_for_day(text, message_day)
+    message_day = None
+    parsed = None
+    resolved_day = None
+    failed_stage = "message_day"
 
-    # "pinpoint fail": a player conceding Pinpoint without a shareable score
-    # card. Resolve it to a worst-case DNF against the day's Pinpoint puzzle so
-    # it still counts as a submission. Applies to fresh posts and edits alike.
-    if not parsed:
-        fail_day = day_key_from_ts(slack_ts)
-        parsed = resolve_pinpoint_fail_score(text, fail_day, store_obj=store)
+    try:
+        message_day = day_key_from_ts(slack_ts)
+        failed_stage = "score_parse"
+        parsed = parse_score_for_day(text, message_day)
+
+        # Resolve Pinpoint concessions using the day's stored puzzle id.
+        if not parsed:
+            failed_stage = "pinpoint_lookup"
+            parsed = resolve_pinpoint_fail_score(text, message_day, store_obj=store)
+    except Exception as exc:
+        _spool_ingestion_failure(
+            body, event_id, message_day, resolved_day, user_id, slack_ts, parsed,
+            text, failed_stage, exc, logger,
+        )
+        return
 
     if not parsed:
-        # Natural-language history queries require an explicit `bot:` prefix.
+        # Natural-language history queries require an explicit bot prefix.
         # Don't trigger NL-query replies for edits — only for fresh posts.
         if subtype != "message_changed" and NL_QUERY_ENABLED and _looks_like_nl_query(text):
             try:
@@ -272,43 +353,16 @@ def handle_message(body, event, logger):
                 logger.exception(f"NL query failed: {e}")
         return
 
-    day = resolve_score_day(message_day, parsed, store_obj=store)
-
     try:
-        store.upsert_score(day, user_id, parsed, slack_ts, text)
-    except Exception as e:
-        logger.exception(
-            "Failed to persist score day=%s user=%s game=%s puzzle_id=%s ts=%s",
-            day,
-            user_id,
-            parsed.game,
-            parsed.puzzle_id,
-            slack_ts,
+        failed_stage = "day_resolution"
+        resolved_day = resolve_score_day(message_day, parsed, store_obj=store)
+        failed_stage = "score_upsert"
+        store.upsert_score(resolved_day, user_id, parsed, slack_ts, text)
+    except Exception as exc:
+        _spool_ingestion_failure(
+            body, event_id, message_day, resolved_day, user_id, slack_ts, parsed,
+            text, failed_stage, exc, logger,
         )
-        try:
-            spool_jsonl(
-                "scores_spool.jsonl",
-                {
-                    "day": day,
-                    "user_id": user_id,
-                    "slack_ts": slack_ts,
-                    "raw_text": text,
-                    "parsed": {
-                        "game": parsed.game,
-                        "puzzle_id": parsed.puzzle_id,
-                        "metric_type": parsed.metric_type,
-                        "metric_value": parsed.metric_value,
-                        "display": parsed.display,
-                        "tiebreak_value": parsed.tiebreak_value,
-                        "status": getattr(parsed, "status", ""),
-                        "score_day": getattr(parsed, "score_day", None),
-                    },
-                    "error": repr(e),
-                    "logged_at": utc_now_iso(),
-                },
-            )
-        except Exception:
-            logger.exception("Failed to spool score write after persistence error")
         return
 
     # Single finalization path
