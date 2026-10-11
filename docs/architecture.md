@@ -103,6 +103,27 @@ therefore needs an explicit repost; automatic retry does not send a second
 summary. This is process-level coordination, not distributed locking or a
 transaction across Google Sheets and Slack.
 
+## Provider failures and operational diagnostics
+
+Sheets operations use finite connection/read timeouts and bounded retries for
+rate limits, temporary server failures, and connection failures. Retry status
+comes from the HTTP response, including HTML error pages whose gspread error
+code is `-1`. Authentication and request-validation failures fail immediately.
+Retry a storage operation, not the complete daily finalization: a successful
+ledger claim followed by a delivery failure still requires an explicit repost.
+
+Live ingestion protects parsing, puzzle-day lookups, and persistence together.
+On exhaustion it preserves the original submission, available parsed fields,
+message day, resolved day if known, and failed stage in a project-local score
+spool. A claimed Events row does not mean its score was successfully saved.
+Local spools require deliberate recovery; they are not a background work queue.
+
+An outer finalization owns one diagnostic tracker and watchdog, reused by nested
+batch/day calls. Phase and elapsed-time logs identify progress. A watchdog
+captures all thread stacks once after its threshold without cancelling the
+operation or releasing locks. Normal and exceptional exits clean up the
+watchdog. Startup logs identify the executable, Python/dependency versions,
+and Git commit without configuration values or credentials.
 ## Verification
 
 Tests use fake worksheets and clients. Cross-module regressions cover

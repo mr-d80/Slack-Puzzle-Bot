@@ -1,7 +1,9 @@
 # gsheets_safe.py
 import json
 import logging
+import math
 import random
+import re
 import threading
 import time
 from datetime import datetime, timezone
@@ -10,6 +12,10 @@ from requests.exceptions import ConnectionError as RequestsConnectionError, Time
 from urllib3.exceptions import ProtocolError
 
 _GS_LOCK = threading.Lock()
+_RETRIABLE_HTTP_STATUS_CODES = frozenset((429, 500, 502, 503, 504))
+_GSPREAD_CALL_ATTEMPTS = 5
+_GSPREAD_CALL_MAX_DELAY_S = 8.0
+logger = logging.getLogger(__name__)
 
 
 class JsonCellTooLargeError(ValueError):
@@ -29,23 +35,93 @@ def is_retriable_net_error(exc: Exception) -> bool:
     return False
 
 
+def response_status_code(exc: Exception) -> int | None:
+    """Return an HTTP status without relying on Response truthiness.
+
+    Requests Response objects are false for error responses. gspread's APIError
+    also uses ``code=-1`` when an HTML gateway body cannot be parsed, so the
+    status must come from ``response.status_code`` instead.
+    """
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    raw = getattr(response, "status_code", None)
+    if raw is None:
+        raw = getattr(response, "status", None)
+    try:
+        return int(raw) if raw is not None else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def is_retriable_sheets_error(exc: Exception) -> bool:
+    """Whether an error is a transient Sheets HTTP response or network error."""
+    status = response_status_code(exc)
+    if status is not None:
+        return status in _RETRIABLE_HTTP_STATUS_CODES
+    return is_retriable_net_error(exc)
+
+
+def retry_after_seconds(exc: Exception, max_delay: float) -> float | None:
+    """Return a finite, positive Retry-After delay capped to the retry budget."""
+    response = getattr(exc, "response", None)
+    if response is None:
+        return None
+    headers = getattr(response, "headers", None)
+    if headers is None:
+        return None
+    raw = headers.get("Retry-After") or headers.get("retry-after")
+    if raw is None:
+        return None
+    try:
+        delay = float(raw)
+    except (TypeError, ValueError, OverflowError):
+        return None
+    if not math.isfinite(delay) or delay <= 0:
+        return None
+    return min(delay, max_delay)
+
+
+def operation_label(fn) -> str:
+    method = getattr(fn, "__func__", fn)
+    name = getattr(method, "__name__", type(method).__name__)
+    return re.sub(r"[^A-Za-z0-9_.-]", "_", str(name))[:80] or "call"
+
+
 def gspread_call(fn, *args, **kwargs):
     """
     Thread-safe + retry wrapper for gspread calls.
     Use this around any append_row / update / batch_update calls.
     """
+    operation = operation_label(fn)
     delay = 0.5
     last_exc: Exception | None = None
 
-    for attempt in range(1, 6):  # 5 tries
+    for attempt in range(1, _GSPREAD_CALL_ATTEMPTS + 1):
         try:
             with _GS_LOCK:
                 return fn(*args, **kwargs)
         except Exception as e:
             last_exc = e
-            if (not is_retriable_net_error(e)) or attempt == 5:
+            status = response_status_code(e)
+            if not is_retriable_sheets_error(e):
                 raise
-            time.sleep(delay + random.random() * delay)  # jitter
+            if attempt == _GSPREAD_CALL_ATTEMPTS:
+                logger.warning(
+                    "Sheets operation %s exhausted %s attempts (status=%s, error_type=%s)",
+                    operation, _GSPREAD_CALL_ATTEMPTS, status, type(e).__name__,
+                )
+                raise
+            sleep_s = retry_after_seconds(e, _GSPREAD_CALL_MAX_DELAY_S)
+            if sleep_s is None:
+                sleep_s = min(delay, _GSPREAD_CALL_MAX_DELAY_S)
+                sleep_s += random.random() * sleep_s
+            logger.warning(
+                "Sheets operation %s failed (status=%s, error_type=%s) on attempt %s/%s; retrying in %.2fs",
+                operation, status, type(e).__name__, attempt,
+                _GSPREAD_CALL_ATTEMPTS, sleep_s,
+            )
+            time.sleep(sleep_s)
             delay = min(delay * 2.0, 8.0)
 
     if last_exc:

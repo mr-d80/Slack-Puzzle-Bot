@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+### Sheets failure recovery
+- Bound Sheets connection/read waits and retry temporary server, rate-limit,
+  and network failures consistently across reads and writes.
+- Preserve failed score-day lookups and score writes in the project-local
+  recovery spool without guessing a score day.
+- Log startup runtime details and finalization progress; capture thread stacks
+  when finalization exceeds its diagnostic threshold.
 ### Repository review fixes
 - Share score-day resolution across live ingestion, Events replay, and history
   recovery. Recovery uses one run-local score snapshot and reports read errors.

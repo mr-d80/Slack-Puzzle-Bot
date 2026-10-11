@@ -531,10 +531,11 @@ class _Sheet:
     def __init__(self, rows, title="Sheet"):
         self.title = title
         self._rows = [list(r) for r in rows]
+        self._grid_row_count = max(len(self._rows), 1)
 
     @property
     def row_count(self):
-        return max(len(self._rows), 1)
+        return max(len(self._rows), self._grid_row_count, 1)
 
     def get_all_values(self):
         return [list(r) for r in self._rows]
@@ -543,17 +544,23 @@ class _Sheet:
         return list(self._rows[n - 1]) if len(self._rows) >= n else []
 
     def update(self, values=None, range_name=None, **kwargs):
-        assert range_name == "A1", range_name
-        if self._rows:
-            self._rows[0] = list(values[0])
-        else:
-            self._rows.append(list(values[0]))
+        if range_name == "A1":
+            if self._rows:
+                self._rows[0] = list(values[0])
+            else:
+                self._rows.append(list(values[0]))
+            return
+        assert range_name == "A2", range_name
+        self._rows = self._rows[:1] + [list(row) for row in values]
 
     def delete_rows(self, start, end=None):
         del self._rows[start - 1:end]
 
     def batch_clear(self, ranges):
         self._rows = self._rows[:1]
+
+    def resize(self, rows):
+        self._grid_row_count = rows
 
     def append_rows(self, rows, value_input_option=None):
         self._rows.extend(list(r) for r in rows)

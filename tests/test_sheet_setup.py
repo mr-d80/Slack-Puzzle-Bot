@@ -2,6 +2,7 @@
 
 import threading
 import unittest
+import os
 from unittest.mock import patch
 
 import gspread
@@ -68,8 +69,13 @@ class MemorySpreadsheet:
 class MemoryClient:
     def __init__(self, spreadsheet):
         self.spreadsheet = spreadsheet
+        self.calls = []
+
+    def set_timeout(self, timeout):
+        self.calls.append(("set_timeout", timeout))
 
     def open_by_key(self, spreadsheet_id):
+        self.calls.append(("open_by_key", spreadsheet_id))
         return self.spreadsheet
 
 
@@ -105,6 +111,35 @@ class SheetStoreSetupTests(unittest.TestCase):
         self.assertEqual(credentials.call_args.kwargs["scopes"], [
             "https://www.googleapis.com/auth/spreadsheets",
         ])
+
+    def test_request_timeout_is_applied_before_opening_the_spreadsheet(self):
+        spreadsheet = MemorySpreadsheet()
+        client = MemoryClient(spreadsheet)
+        with patch.dict(os.environ, {
+            "SHEETS_CONNECT_TIMEOUT_S": "2.5",
+            "SHEETS_READ_TIMEOUT_S": "11",
+        }):
+            with patch("sheet_store.Credentials.from_service_account_file", return_value=object()):
+                with patch("sheet_store.gspread.authorize", return_value=client):
+                    SheetStore("fake-spreadsheet-id", "fake-service-account.json")
+
+        self.assertEqual(client.calls[:2], [
+            ("set_timeout", (2.5, 11.0)),
+            ("open_by_key", "fake-spreadsheet-id"),
+        ])
+
+    def test_invalid_request_timeout_values_use_finite_positive_defaults(self):
+        spreadsheet = MemorySpreadsheet()
+        client = MemoryClient(spreadsheet)
+        with patch.dict(os.environ, {
+            "SHEETS_CONNECT_TIMEOUT_S": "NaN",
+            "SHEETS_READ_TIMEOUT_S": "0",
+        }):
+            with patch("sheet_store.Credentials.from_service_account_file", return_value=object()):
+                with patch("sheet_store.gspread.authorize", return_value=client):
+                    SheetStore("fake-spreadsheet-id", "fake-service-account.json")
+
+        self.assertEqual(client.calls[0], ("set_timeout", (10.0, 30.0)))
 
     def test_existing_worksheets_and_data_are_preserved(self):
         schemas = {

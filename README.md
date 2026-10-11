@@ -192,6 +192,27 @@ Utility commands load the bot and connect to Sheets even when only printing
 output. `reconcile_day.py --no-post` still writes score/results data. Back up
 your spreadsheet before forcing or rebuilding results.
 
+## Connection failures and diagnostics
+
+Google Sheets requests have connect/read timeouts, and temporary server,
+rate-limit, and network failures receive bounded retries. Set
+`SHEETS_CONNECT_TIMEOUT_S` and `SHEETS_READ_TIMEOUT_S` in `.env` to adjust the
+10-second connect and 30-second read defaults. These are per-request limits;
+retries can make the overall operation take longer.
+
+If score parsing, score-day lookup, or storage fails, the bot preserves the
+submission in `scores_spool.jsonl` in the project directory. A failed day lookup
+does not save a score under a guessed day. Spools are recovery evidence, not an
+automatically replayed queue. Use the history recovery commands above after
+connectivity returns, and check the affected day's Scores and DailyResults.
+
+Startup logs identify the Python executable, dependency versions, and Git
+commit. Finalization logs identify its day, current operation, and elapsed time.
+If finalization exceeds `FINALIZATION_STALL_TIMEOUT_S` (default 120 seconds),
+the bot captures one thread-stack dump in `logs/finalization-stalls.log` for
+that run. The watchdog records diagnostics without interrupting work or
+releasing the finalization lock. Keep logs and spools private.
+
 ## Experimental games
 
 **Wordle, 4×6, 4×3, and MapTap remain untested with real Slack submissions.**
